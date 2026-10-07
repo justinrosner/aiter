@@ -572,6 +572,119 @@ def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
         assert (storage[..., :offset].float() == 16).all()
 
 
+@pytest.mark.parametrize("num_heads", [(16, 1), (64, 1), (32, 2)])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, block_size",
+    [
+        (torch.bfloat16, e4m3_dtype, 64),
+        (torch.bfloat16, e4m3_dtype, 128),
+        (torch.bfloat16, torch.bfloat16, 64),
+        (e4m3_dtype, e4m3_dtype, 128),
+    ],
+)
+@torch.inference_mode()
+def test_mla_decode_fwd_unshuffled_pipelined(
+    monkeypatch,
+    num_heads: tuple[int, int],
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    block_size: int,
+):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("pipelined Gluon MLA decode requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+
+    torch.manual_seed(0)
+    num_query_heads, num_kv_heads = num_heads
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    # Single-token, single-page, partial last page, and multi-segment lengths.
+    lengths = [1, 63, 64, 65, 2 * block_size + 1, 1000, 4097]
+    batch_size = len(lengths)
+    num_blocks = 1024
+    max_num_blocks_per_seq = (max(lengths) + block_size - 1) // block_size
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32)
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32)
+    block_tables = torch.randint(
+        0, num_blocks, (batch_size, max_num_blocks_per_seq), dtype=torch.int32
+    )
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_dim), dtype=torch.bfloat16
+    ).to(kv_dtype)
+    query = torch.randn(
+        (batch_size, num_query_heads, head_dim), dtype=torch.bfloat16
+    ).to(q_dtype)
+    q_descale = None if q_dtype == torch.bfloat16 else torch.tensor([0.3])
+    kv_descale = None if kv_dtype == torch.bfloat16 else torch.tensor([0.4])
+    sm_scale = head_dim**-0.5
+    output = torch.empty(
+        (batch_size, num_query_heads, kv_lora_rank), dtype=torch.bfloat16
+    )
+
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=max(lengths),
+        block_tables=block_tables,
+        softmax_scale=sm_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        shuffled_kv_cache=False,
+    )
+    assert len(launches) == 1
+    assert not launches[0]["SHUFFLED_KV_CACHE"]
+    assert not launches[0].get("USE_LDS_PIPELINE", False)
+
+    ref_output = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        kv_lora_rank,
+        sm_scale,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        o_dtype=torch.bfloat16,
+    )
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    tol_err_ratio = 0.01
+    assert torch.isfinite(output.float()).all()
+    assert (
+        checkAllclose(
+            output,
+            ref_output,
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd unshuffled pipelined output",
+        )
+        <= tol_err_ratio
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
@@ -787,6 +900,113 @@ def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head
     torch.testing.assert_close(o_big, o_ref, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("shuffled_kv_cache", [False, True])
+@torch.inference_mode()
+def test_mla_decode_fwd_over_2gb_gfx1250(monkeypatch, shuffled_kv_cache: bool):
+    """Pipelined Gluon MLA decode (gfx1250) reading pages past 2 GB of KV cache."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("pipelined Gluon MLA decode requires gfx1250")
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < int(3.5 * 2**30):
+        pytest.skip("needs >3.5 GiB free for the >2 GB cache")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+
+    torch.manual_seed(0)
+    block_size, num_query_heads = 64, 16
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    lengths = [777, 4097, 65, 2048]
+    batch_size = len(lengths)
+    pages_per_seq = (max(lengths) + block_size - 1) // block_size
+    num_used = batch_size * pages_per_seq
+    # fp8 pages of block_size * head_dim bytes; the used pages sit past 2 GB.
+    num_big = 2**31 // (block_size * head_dim) + num_used + 1024
+    base = num_big - num_used
+
+    kv_small = torch.randn(
+        (num_used, block_size, 1, head_dim), dtype=torch.bfloat16
+    ).to(e4m3_dtype)
+    if shuffled_kv_cache:
+        kv_shape = (num_big, 1, block_size, head_dim)
+        kv_used = shuffle_kv_buffer(kv_small, kv_lora_rank)
+    else:
+        kv_shape = (num_big, block_size, 1, head_dim)
+        kv_used = kv_small
+    kv_big = torch.zeros(kv_shape, dtype=torch.uint8).view(e4m3_dtype)
+    kv_big[base:].copy_(kv_used)
+    assert kv_big.numel() * kv_big.element_size() > 2**31
+
+    block_tables = torch.arange(num_used, dtype=torch.int32).view(
+        batch_size, pages_per_seq
+    )
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32)
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32)
+    query = torch.randn((batch_size, num_query_heads, head_dim), dtype=torch.bfloat16)
+    kv_descale = torch.tensor([0.4])
+    sm_scale = head_dim**-0.5
+    output = torch.empty(
+        (batch_size, num_query_heads, kv_lora_rank), dtype=torch.bfloat16
+    )
+
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_big,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=max(lengths),
+        block_tables=block_tables + base,
+        softmax_scale=sm_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=None,
+        kv_descale=kv_descale,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+    assert len(launches) == 1
+
+    ref_output = torch_mla_extend(
+        query,
+        kv_small,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        kv_lora_rank,
+        sm_scale,
+        kv_descale=kv_descale,
+        o_dtype=torch.bfloat16,
+    )
+    tol_err_ratio = 0.01
+    assert torch.isfinite(output.float()).all()
+    assert (
+        checkAllclose(
+            output,
+            ref_output,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd >2 GB KV cache output",
+        )
+        <= tol_err_ratio
+    )
+
+
 @pytest.mark.parametrize(
     "batch_size,ctx_lens,skip_reduce,wide_view,extra_tokens,expected_pipeline",
     [
@@ -880,3 +1100,106 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         assert isinstance(result, tuple) and len(result) == 3
     else:
         assert result is output
+
+
+@pytest.mark.parametrize(
+    "shuffled_kv_cache,block_size,qlen,page_padding,num_query_heads,kv_dtype,expected",
+    [
+        (False, 64, 1, 0, 16, e4m3_dtype, "pipelined"),
+        (False, 128, 1, 0, 16, e4m3_dtype, "pipelined"),
+        (False, 128, 1, 0, 64, e4m3_dtype, "pipelined"),
+        (False, 64, 1, 0, 128, torch.bfloat16, "pipelined"),
+        # Two padded KV stages plus Q exceed the LDS budget.
+        (False, 128, 1, 0, 128, e4m3_dtype, "non_pipelined"),
+        (False, 128, 1, 0, 16, torch.bfloat16, "non_pipelined"),
+        (False, 16, 1, 0, 16, e4m3_dtype, "non_pipelined"),
+        (False, 1, 1, 0, 16, e4m3_dtype, "non_pipelined"),
+        (False, 64, 3, 0, 16, e4m3_dtype, "non_pipelined"),
+        # Pages that are not one flat token table.
+        (False, 64, 1, 576, 16, e4m3_dtype, "non_pipelined"),
+        (True, 64, 1, 0, 16, e4m3_dtype, "pipelined"),
+    ],
+)
+def test_mla_decode_fwd_unshuffled_dispatch(
+    monkeypatch,
+    shuffled_kv_cache: bool,
+    block_size: int,
+    qlen: int,
+    page_padding: int,
+    num_query_heads: int,
+    kv_dtype: torch.dtype,
+    expected: str,
+):
+    import aiter.ops.triton.attention.mla as mla_module
+
+    monkeypatch.setattr(mla_module, "DEVICE_ARCH", "gfx1250")
+    monkeypatch.setattr(mla_module, "IS_DEVICE_ARCH_GFX12", True)
+    monkeypatch.setattr(mla_module, "get_num_sms", lambda: 192)
+    launches = []
+
+    class CaptureLaunch:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((self.name, kwargs))
+
+            return launch
+
+    class SkipLaunch:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(
+        mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch("pipelined")
+    )
+    monkeypatch.setattr(
+        mla_module,
+        "gluon_mla_decode_fwd_kernel_non_pipelined",
+        CaptureLaunch("non_pipelined"),
+    )
+    monkeypatch.setattr(mla_module, "triton_mla_decode_fwd_reduce_kernel", SkipLaunch())
+    # Metadata-only dispatch checks: no large allocation and no GPU launch.
+    batch_size, num_blocks, head_dim = 16, 64, 576
+    query = torch.empty(
+        (batch_size * qlen, num_query_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="meta",
+    )
+    if shuffled_kv_cache:
+        kv_shape = (num_blocks, 1, block_size, head_dim)
+    else:
+        kv_shape = (num_blocks, block_size, 1, head_dim)
+    kv_strides = list(torch.empty(kv_shape, device="meta").stride())
+    kv_strides[0] += page_padding
+    kv_buffer = torch.empty_strided(kv_shape, kv_strides, dtype=kv_dtype, device="meta")
+    output = torch.empty(
+        (batch_size * qlen, num_query_heads, 512), dtype=torch.bfloat16, device="meta"
+    )
+    block_tables = torch.empty((batch_size, 32), dtype=torch.int32, device="meta")
+    cu_seqlens_q = torch.empty((batch_size + 1,), dtype=torch.int32, device="meta")
+    seq_lens_kv = torch.empty((batch_size,), dtype=torch.int32, device="meta")
+    mla_module.mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=2048,
+        block_tables=block_tables,
+        softmax_scale=576**-0.5,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        causal=True,
+        q_descale=None,
+        kv_descale=None,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+    assert len(launches) == 1
+    name, kwargs = launches[0]
+    assert name == expected
+    if expected == "pipelined":
+        assert kwargs["SHUFFLED_KV_CACHE"] == shuffled_kv_cache
+        assert kwargs["num_stages"] == 2
+        assert not kwargs.get("USE_LDS_PIPELINE", False)

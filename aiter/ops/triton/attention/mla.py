@@ -261,6 +261,14 @@ def mla_prefill_fwd(
     return out
 
 
+def _pipelined_unshuffled_lds_bytes(
+    block_size, block_m, kv_lora_rank, qk_rope_head_dim, kv_elem_size, q_elem_size
+):
+    # Two padded TDM stages of KV plus the padded Q tile; each row is padded by 8.
+    padded_row = (kv_lora_rank + 8) + (qk_rope_head_dim + 8)
+    return padded_row * (2 * block_size * kv_elem_size + block_m * q_elem_size)
+
+
 def _fits_int32_offsets(tensor):
     # Kernels receive a pointer to the view origin, so storage_offset is not
     # part of the relative index. numel alone does not bound a strided view.
@@ -413,6 +421,32 @@ def mla_decode_fwd(
         and _fits_int32_offsets(out)
         and _fits_int32_offsets(block_tables)
     )
+    # The pipelined kernel reads unshuffled pages as tiles of one flat token
+    # table. Multi-token decode stays on the non-pipelined kernel: the pipelined
+    # epilogue always processes a tile, even in a segment past a query's prefix.
+    use_pipelined_unshuffled = (
+        IS_DEVICE_ARCH_GFX12
+        and not shuffled_kv_cache
+        and ALL_DECODE
+        and KV_CACHE_DTYPE in ("bf16", "fp8")
+        and block_size in (64, 128)
+        and kv_buffer.stride(3) == 1
+        and kv_buffer.stride(0) == block_size * kv_buffer.stride(1)
+        and (
+            num_kv_heads == 1 or kv_buffer.stride(2) == kv_lora_rank + qk_rope_head_dim
+        )
+        and num_blocks * block_size < 2**31
+        # Leave headroom in gfx1250's 320 KB LDS for layout-conversion scratch.
+        and _pipelined_unshuffled_lds_bytes(
+            block_size,
+            BLOCK_M,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            kv_buffer.element_size(),
+            q.element_size(),
+        )
+        <= 256 * 1024
+    )
     NUM_SEGMENTS = 1 if use_lds_pipeline else selected_num_segments
     if NUM_SEGMENTS > 1:
         segm_output = torch.empty(
@@ -460,7 +494,7 @@ def mla_decode_fwd(
             ),
         )
     if IS_DEVICE_ARCH_GFX12:
-        if shuffled_kv_cache:
+        if shuffled_kv_cache or use_pipelined_unshuffled:
             impl = gluon_mla_decode_fwd_kernel
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
