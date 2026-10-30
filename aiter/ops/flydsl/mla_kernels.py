@@ -376,13 +376,46 @@ def _validate_pagesize64_inputs(
     num_splits,
     page_size,
 ):
-
-    batch = q.size(0)
     fp8 = torch.float8_e4m3fn
+    _require_runtime(
+        str(get_rocm_arch()).split(":", 1)[0] == "gfx1250", "expected gfx1250"
+    )
+    _require(page_size == 64, "page_size must be 64")
+    _require(
+        isinstance(num_splits, int) and num_splits > 0, "num_splits must be positive"
+    )
+    _require(
+        q.ndim == 3 and q.shape[1] in (8, 64, 128) and q.shape[2] == 576,
+        "q must have shape [batch, 8/64/128, 576]",
+    )
+    batch, heads, _ = q.shape
+    _require(batch > 0, "q must contain at least one sequence")
+    _require(q.dtype == fp8, "q must use float8_e4m3fn")
+    valid_strides = (576, 768) if heads == 128 else (576,)
+    _require(
+        q.stride(2) == 1
+        and q.stride(1) in valid_strides
+        and q.stride(0) == heads * q.stride(1),
+        "unsupported q strides",
+    )
+    for tensor in (
+        split_data,
+        split_lse,
+        kv_buffer,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        qo_indptr,
+        num_kv_splits_indptr,
+        q_scale,
+        kv_scale,
+    ):
+        _require(tensor.device == q.device, "all tensors must be on q.device")
+    _require(q.is_cuda, "q must be on a GPU")
     _require_layout("kv_buffer", kv_buffer, fp8, (None, 64 * 576))
     for name, tensor, shape in (
         ("kv_indptr", kv_indptr, (batch + 1,)),
-        ("kv_page_indices", kv_page_indices, None),
+        ("kv_page_indices", kv_page_indices, (None,)),
         ("kv_last_page_lens", kv_last_page_lens, (batch,)),
         ("qo_indptr", qo_indptr, (batch + 1,)),
         ("num_kv_splits_indptr", num_kv_splits_indptr, (batch + 1,)),
@@ -393,12 +426,14 @@ def _validate_pagesize64_inputs(
         _require_layout(name, tensor, dtype, shape)
 
     if num_splits == 1:
-        _require_layout("split_data", split_data, torch.bfloat16, (batch, 128, 512))
+        _require_layout("split_data", split_data, torch.bfloat16, (batch, heads, 512))
     else:
         _require_layout(
-            "split_data", split_data, torch.float32, (batch, num_splits, 128, 512)
+            "split_data", split_data, torch.float32, (batch, num_splits, heads, 512)
         )
-    _require_layout("split_lse", split_lse, torch.float32, (batch, num_splits, 128, 1))
+    _require_layout(
+        "split_lse", split_lse, torch.float32, (batch, num_splits, heads, 1)
+    )
     return batch
 
 
@@ -420,6 +455,19 @@ def flydsl_mla_pagesize64_fp8_fp8(
     page_size=64,
     stream=None,
 ):
+    """Decode one query per sequence from packed FP8 page64 KV on gfx1250.
+
+    Q is native [batch, heads, 576] for heads 8/64/128. Legacy H128 Q with
+    head stride 768 is also supported. KV pages contain contiguous [64,512]
+    NoPE followed by [64,64] RoPE, rather than interleaved token rows.
+    S1 writes BF16 [batch,heads,512]; otherwise FP32 [batch,splits,heads,512]
+    partials are merged by ``flydsl_mla_decode_reduce``. LSE is always FP32
+    [batch,splits,heads,1]. Empty splits remain untouched.
+
+    The caller supplies valid page indices, nonempty sequences, one query per
+    sequence in qo_indptr, and last-page lengths in [1,64]. Metadata contents
+    are not copied to the host, so this wrapper remains graph-capturable.
+    """
     batch = _validate_pagesize64_inputs(
         split_data,
         split_lse,
@@ -460,7 +508,9 @@ def flydsl_mla_pagesize64_fp8_fp8(
         num_splits,
         int(num_splits == 1),
         stream,
-        specialization_key=int(num_splits == 1),
+        q.shape[1],
+        q.stride(1),
+        specialization_key=(int(num_splits == 1), q.shape[1], q.stride(1)),
     )
 
 

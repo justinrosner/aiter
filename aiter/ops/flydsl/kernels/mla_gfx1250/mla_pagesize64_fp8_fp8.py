@@ -105,7 +105,16 @@ def launch_mla_pagesize64_fp8_fp8(
     num_splits: fx.Int32,
     out_16_nosplit: fx.Constexpr[int],
     stream: fx.Stream = _DEFAULT_STREAM,
+    num_q_heads: fx.Constexpr[int] = 128,
+    q_head_stride: fx.Constexpr[int] = 768,
 ):
+    NUM_Q_HEADS = num_q_heads
+    NUM_HEAD_GROUPS = max(1, num_q_heads // HEADS_PER_GROUP)
+    Q_HEAD_STRIDE = q_head_stride
+    Q_ROW_STRIDE = num_q_heads * q_head_stride
+    Q_GROUP_STRIDE = HEADS_PER_GROUP * q_head_stride
+    Q_WAVE_STRIDE = HEADS_PER_WAVE * q_head_stride
+    PV_D_TILES = 8 if num_q_heads == 8 else 32
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -157,13 +166,17 @@ def launch_mla_pagesize64_fp8_fp8(
         _, batch_id, z = fx.block_idx
         batch_i32 = fx.Int32(batch_id)
 
-        head_group = z & 1
-        split_id = z >> 1
+        head_group = z % NUM_HEAD_GROUPS
+        split_id = z // NUM_HEAD_GROUPS
         wave_id = rocdl.readfirstlane(T.i32, tid >> 5)
         lane_id = tid & (WAVE_SIZE - 1)
         head_in_wave = lane_id & (HEADS_PER_WAVE - 1)
         lane_half = lane_id >> 4
         head = head_group * HEADS_PER_GROUP + wave_id * HEADS_PER_WAVE + head_in_wave
+        pv_dim_base = fx.Int32(0)
+        if const_expr(NUM_Q_HEADS == 8):
+            head = head_in_wave
+            pv_dim_base = wave_id * 128
 
         def lds_segment_byte(slot):
             return (wave_id * LDS_WAVE_BYTES) ^ (slot * LDS_WAVE_BYTES)
@@ -181,6 +194,10 @@ def launch_mla_pagesize64_fp8_fp8(
 
         q_unit_base = fx.Int32(q_tile_base >> 4)
         q_head_dwords = head_in_wave * (Q_HEAD_STRIDE // 4)
+        if const_expr(NUM_Q_HEADS == 8):
+            q_unit_base = fx.Int32(q_row_base >> 4)
+            # Inactive WMMA rows use an in-range address, then zero the registers.
+            q_head_dwords = (head_in_wave & 7) * (Q_HEAD_STRIDE // 4)
         q_lane_dwords = q_head_dwords + lane_half * 4
 
         def load_q_b128(dword_offset):
@@ -189,7 +206,16 @@ def launch_mla_pagesize64_fp8_fp8(
                 fx.slice(q_t, (q_unit_base + dword_offset // 4, None)),
                 q_frag,
             )
-            return q_frag.load()
+            values = Vec(q_frag.load())
+            if const_expr(NUM_Q_HEADS == 8):
+                values = Vec.from_elements(
+                    [
+                        (head_in_wave < 8).select(values[i], fx.Int32(0))
+                        for i in range_constexpr(4)
+                    ],
+                    fx.Int32,
+                )
+            return values
 
         q_nope_chunks = []
         for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
@@ -370,6 +396,7 @@ def launch_mla_pagesize64_fp8_fp8(
                         + pending_stage * KV_STAGE_BYTES
                         + v_row * Q_LDS_ROW_BYTES
                         + v_col
+                        + pv_dim_base
                         + dv_tile * 16
                     )
                     v_ptr = fx.add_offset(lds_base, v_byte_offset)
@@ -477,14 +504,16 @@ def launch_mla_pagesize64_fp8_fp8(
                 qk_accs.append(qk_acc)
             pv_ready_outs = running_outs
             if const_expr(pv_pending):
-                pv_ready_outs = compute_pending_pv(
-                    running_outs,
-                    pending_alpha,
-                    pending_stage,
-                    pending_valid_len,
-                    pending_probability_words,
-                    False if pv_masked is None else pv_masked,
-                )
+                # The first iteration has no deferred PV; LDS can contain NaNs.
+                if pending_valid != 0:
+                    pv_ready_outs = compute_pending_pv(
+                        running_outs,
+                        pending_alpha,
+                        pending_stage,
+                        pending_valid_len,
+                        pending_probability_words,
+                        False if pv_masked is None else pv_masked,
+                    )
             elif pending_valid != 0:
                 if const_expr(pv_masked is None):
                     if pending_valid_len == fx.Int32(PAGE_SIZE):
@@ -788,7 +817,28 @@ def launch_mla_pagesize64_fp8_fp8(
                 * NUM_Q_HEADS
                 + fx.Int64(head)
             ) * V_HEAD_DIM
-            if const_expr(out_16_nosplit):
+            if const_expr(NUM_Q_HEADS == 8):
+                if head < NUM_Q_HEADS:
+                    if const_expr(out_16_nosplit):
+                        r_bf16 = ptr_buf_tensor(ptr_r, fx.BFloat16)
+                        for dv_tile in range_constexpr(PV_D_TILES):
+                            for i in range_constexpr(PV_ACC_DWORDS):
+                                output_dim = (
+                                    pv_dim_base + dv_tile * 16 + lane_half * 8 + i
+                                )
+                                r_bf16[fx.Int32(output_base + output_dim)] = (
+                                    output_accs[dv_tile][i] * output_scale
+                                ).to(fx.BFloat16)
+                    else:
+                        for dv_tile in range_constexpr(PV_D_TILES):
+                            for i in range_constexpr(PV_ACC_DWORDS):
+                                output_dim = (
+                                    pv_dim_base + dv_tile * 16 + lane_half * 8 + i
+                                )
+                                r_f32[fx.Int32(output_base + output_dim)] = (
+                                    output_accs[dv_tile][i] * output_scale
+                                )
+            elif const_expr(out_16_nosplit):
                 for dv_tile in range_constexpr(PV_D_TILES):
                     output_values = []
                     for i in range_constexpr(PV_ACC_DWORDS):
@@ -871,7 +921,10 @@ def launch_mla_pagesize64_fp8_fp8(
                             output_accs[dv_tile][i] * output_scale
                         )
 
-            if lane_half == fx.Int32(0):
+            write_lse = lane_half == fx.Int32(0)
+            if const_expr(NUM_Q_HEADS == 8):
+                write_lse = write_lse & (wave_id == 0) & (head < NUM_Q_HEADS)
+            if write_lse:
                 lse_offset = (
                     fx.Int64(batch_id) * fx.Int64(num_splits) + fx.Int64(split_id)
                 ) * NUM_Q_HEADS + fx.Int64(head)
