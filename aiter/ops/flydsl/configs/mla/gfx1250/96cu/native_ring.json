@@ -3,43 +3,9 @@
   "contract": "native-h64-fp8-page64-q576-kv576-natural-lse-v2",
   "arch": "gfx1250",
   "cu_num": 96,
-  "implementation_sha256": "edba49983c63180fece3a25da5a8215e3c6eb35ea01ccfd8990de233c2c67283",
+  "implementation_sha256": "84d48dd9da42b314ed82ad6411d8a6b58a392a40d5dd7900340fc03409376c4c",
   "buckets": {
     "H_LEQ_32": {},
-    "H_LEQ_64.B_LEQ_14": {},
-    "H_LEQ_64.B_LEQ_15.KV_LEQ_131072": {},
-    "H_LEQ_64.B_LEQ_15.KV_LEQ_262144": {
-      "kv_num_stages": 3,
-      "waves_per_eu": 2,
-      "pv_load_depth": 8,
-      "pipelined": true,
-      "num_splits": 32
-    },
-    "H_LEQ_64.B_LEQ_18": {},
-    "H_LEQ_64.B_LEQ_19.KV_LEQ_32768": {},
-    "H_LEQ_64.B_LEQ_19.KV_LEQ_131072": {
-      "kv_num_stages": 3,
-      "waves_per_eu": 2,
-      "pv_load_depth": 8,
-      "pipelined": true,
-      "num_splits": 8
-    },
-    "H_LEQ_64.B_LEQ_31": {},
-    "H_LEQ_64.B_LEQ_32.KV_LEQ_16384": {},
-    "H_LEQ_64.B_LEQ_32.KV_LEQ_32768": {
-      "kv_num_stages": 3,
-      "waves_per_eu": 2,
-      "pv_load_depth": 8,
-      "pipelined": true,
-      "num_splits": 8
-    },
-    "H_LEQ_64.B_LEQ_32.KV_LEQ_131072": {
-      "kv_num_stages": 3,
-      "waves_per_eu": 2,
-      "pv_load_depth": 8,
-      "pipelined": true,
-      "num_splits": 16
-    },
     "H_LEQ_64.B_LEQ_127": {},
     "H_LEQ_64.B_LEQ_128.KV_LEQ_16384": {},
     "H_LEQ_64.B_LEQ_128.KV_LEQ_32768": {
@@ -47,120 +13,104 @@
       "waves_per_eu": 2,
       "pv_load_depth": 4,
       "pipelined": true,
-      "num_splits": 4
+      "partial_bf16": true,
+      "num_splits": 3
+    },
+    "H_LEQ_64.B_LEQ_14": {},
+    "H_LEQ_64.B_LEQ_15.KV_LEQ_131072": {},
+    "H_LEQ_64.B_LEQ_15.KV_LEQ_262144": {
+      "kv_num_stages": 3,
+      "waves_per_eu": 2,
+      "pv_load_depth": 4,
+      "pipelined": true,
+      "partial_bf16": true,
+      "num_splits": 25
+    },
+    "H_LEQ_64.B_LEQ_18": {},
+    "H_LEQ_64.B_LEQ_19.KV_LEQ_131072": {
+      "kv_num_stages": 3,
+      "waves_per_eu": 2,
+      "pv_load_depth": 4,
+      "pipelined": true,
+      "partial_bf16": true,
+      "num_splits": 10
+    },
+    "H_LEQ_64.B_LEQ_19.KV_LEQ_32768": {},
+    "H_LEQ_64.B_LEQ_31": {},
+    "H_LEQ_64.B_LEQ_32.KV_LEQ_131072": {
+      "kv_num_stages": 3,
+      "waves_per_eu": 2,
+      "pv_load_depth": 8,
+      "pipelined": true,
+      "partial_bf16": false,
+      "num_splits": 6
+    },
+    "H_LEQ_64.B_LEQ_32.KV_LEQ_16384": {},
+    "H_LEQ_64.B_LEQ_32.KV_LEQ_32768": {
+      "kv_num_stages": 3,
+      "waves_per_eu": 2,
+      "pv_load_depth": 1,
+      "pipelined": true,
+      "partial_bf16": true,
+      "num_splits": 6
     },
     "any": {}
   },
   "evidence": {
-    "H_LEQ_64.B_LEQ_15.KV_LEQ_262144": {
-      "median_us": 492.94599890708923,
-      "balanced_median_us": {
-        "Native": 492.94599890708923,
-        "Old": 662.5708639621735,
-        "Gluon": 424.0359961986542
+    "H_LEQ_64.B_LEQ_32.KV_LEQ_32768": {
+      "measured_shape": "B32.H64.L16401",
+      "metric": "SQ_CYCLES/CU (attention+reducer) fitted a+b*f, at 1.5 GHz",
+      "cycles_per_cu_at_1p5ghz": {
+        "Native": 159072.21572775516,
+        "Gluon": 178882.3683123017,
+        "Old": 282720.9340924171
       },
-      "balanced_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/balanced_confirm.jsonl",
-      "sq_cycles_median": {
-        "Native": 48946576.0,
-        "Old": 80198608.0,
-        "Gluon": 51098400.0
-      },
-      "cycles_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_final_threeway.json",
-      "selection_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/selected.json",
-      "faster_than_old": true,
-      "native_vs_old_wall": 0.7439898518315043,
-      "native_vs_gluon_wall": 1.1625097947490095,
-      "native_vs_old_cycles": 0.6103170269488967,
-      "native_vs_gluon_cycles": 0.9578886227357413,
-      "measured_shape": "B15.H64.L131089"
+      "screening": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_s7_case0.json",
+      "refinement": "/home/jrosner/flydsl_mla_native_ring_align_20261104/clockfit_s7_refine0.json"
     },
     "H_LEQ_64.B_LEQ_19.KV_LEQ_131072": {
-      "median_us": 291.5387451648712,
-      "balanced_median_us": {
-        "Native": 291.5387451648712,
-        "Old": 435.7333779335022,
-        "Gluon": 286.61274909973145
+      "measured_shape": "B19.H64.L65553",
+      "metric": "SQ_CYCLES/CU (attention+reducer) fitted a+b*f, at 1.5 GHz",
+      "cycles_per_cu_at_1p5ghz": {
+        "Native": 297721.88946168404,
+        "Gluon": 322644.2384851135,
+        "Old": 555402.5751561022
       },
-      "balanced_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/balanced_confirm.jsonl",
-      "sq_cycles_median": {
-        "Native": 35327904.0,
-        "Old": 52070848.0,
-        "Gluon": 38275632.0
-      },
-      "cycles_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_final_threeway.json",
-      "selection_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/selected.json",
-      "faster_than_old": true,
-      "native_vs_old_wall": 0.6690759990605156,
-      "native_vs_gluon_wall": 1.0171869398015707,
-      "native_vs_old_cycles": 0.6784583957610985,
-      "native_vs_gluon_cycles": 0.9229868235748531,
-      "measured_shape": "B19.H64.L65553"
+      "screening": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_s7_case1.json",
+      "refinement": "/home/jrosner/flydsl_mla_native_ring_align_20261104/clockfit_s7_refine1.json"
     },
-    "H_LEQ_64.B_LEQ_32.KV_LEQ_32768": {
-      "median_us": 134.08206403255463,
-      "balanced_median_us": {
-        "Native": 134.08206403255463,
-        "Old": 192.0158714056015,
-        "Gluon": 140.0834359228611
+    "H_LEQ_64.B_LEQ_15.KV_LEQ_262144": {
+      "measured_shape": "B15.H64.L131089",
+      "metric": "SQ_CYCLES/CU (attention+reducer) fitted a+b*f, at 1.5 GHz",
+      "cycles_per_cu_at_1p5ghz": {
+        "Native": 453776.6447973288,
+        "Gluon": 499919.8516332728,
+        "Old": 833287.9758314551
       },
-      "balanced_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/balanced_confirm.jsonl",
-      "sq_cycles_median": {
-        "Native": 21598080.0,
-        "Old": 24612352.0,
-        "Gluon": 22994112.0
-      },
-      "cycles_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_final_threeway.json",
-      "selection_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/selected.json",
-      "faster_than_old": true,
-      "native_vs_old_wall": 0.698286360658847,
-      "native_vs_gluon_wall": 0.9571585901590021,
-      "native_vs_old_cycles": 0.8775301117097627,
-      "native_vs_gluon_cycles": 0.9392874140997487,
-      "measured_shape": "B32.H64.L16401"
-    },
-    "H_LEQ_64.B_LEQ_32.KV_LEQ_131072": {
-      "median_us": 543.3759987354279,
-      "balanced_median_us": {
-        "Native": 543.3759987354279,
-        "Old": 656.6733717918396,
-        "Gluon": 515.7726109027863
-      },
-      "balanced_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/balanced_confirm.jsonl",
-      "sq_cycles_median": {
-        "Native": 54412000.0,
-        "Old": 79046432.0,
-        "Gluon": 54085632.0
-      },
-      "cycles_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_final_threeway.json",
-      "selection_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/selected.json",
-      "faster_than_old": true,
-      "native_vs_old_wall": 0.8274676910573342,
-      "native_vs_gluon_wall": 1.0535185220175336,
-      "native_vs_old_cycles": 0.6883549152477876,
-      "native_vs_gluon_cycles": 1.0060342828202506,
-      "measured_shape": "B32.H64.L65553"
+      "screening": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_s7_case2.json",
+      "refinement": "/home/jrosner/flydsl_mla_native_ring_align_20261104/clockfit_s7_refine2.json"
     },
     "H_LEQ_64.B_LEQ_128.KV_LEQ_32768": {
-      "median_us": 513.4027451276779,
-      "balanced_median_us": {
-        "Native": 513.4027451276779,
-        "Old": 643.292248249054,
-        "Gluon": 502.257376909256
+      "measured_shape": "B128.H64.L16401",
+      "metric": "SQ_CYCLES/CU (attention+reducer) fitted a+b*f, at 1.5 GHz",
+      "cycles_per_cu_at_1p5ghz": {
+        "Native": 487384.9640057613,
+        "Gluon": 512144.3004506966,
+        "Old": 819943.7427328773
       },
-      "balanced_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/balanced_confirm.jsonl",
-      "sq_cycles_median": {
-        "Native": 56205792.0,
-        "Old": 76442720.0,
-        "Gluon": 55525312.0
+      "screening": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_s7_case3.json",
+      "refinement": "/home/jrosner/flydsl_mla_native_ring_align_20261104/clockfit_s7_refine3.json"
+    },
+    "H_LEQ_64.B_LEQ_32.KV_LEQ_131072": {
+      "measured_shape": "B32.H64.L65553",
+      "metric": "SQ_CYCLES/CU (attention+reducer) fitted a+b*f, at 1.5 GHz",
+      "cycles_per_cu_at_1p5ghz": {
+        "Native": 460694.193601542,
+        "Gluon": 495864.0983178492,
+        "Old": 842958.2596576161
       },
-      "cycles_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_final_threeway.json",
-      "selection_evidence": "/home/jrosner/flydsl_mla_native_ring_align_20261104/selected.json",
-      "faster_than_old": true,
-      "native_vs_old_wall": 0.7980863231681775,
-      "native_vs_gluon_wall": 1.022190551559456,
-      "native_vs_old_cycles": 0.7352667722969565,
-      "native_vs_gluon_cycles": 1.0122553115955477,
-      "measured_shape": "B128.H64.L16401"
+      "screening": "/home/jrosner/flydsl_mla_native_ring_align_20261104/cycles_s7_case4.json",
+      "refinement": "/home/jrosner/flydsl_mla_native_ring_align_20261104/clockfit_s7_refine4.json"
     }
   },
   "selection_scope": "flydsl_mla_decode_pagesize64_fp8 routes measured buckets to the native ring; empty buckets and \"any\" use the packed old-kernel fallback"

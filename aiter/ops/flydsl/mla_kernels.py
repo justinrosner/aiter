@@ -548,12 +548,15 @@ def flydsl_mla_pagesize64_fp8_fp8(
 def flydsl_mla_pagesize64_fp8_fp8_ring(
     split_data, split_lse, q, kv, block_tables, seqused_k,
     q_scale, kv_scale, softmax_scale, num_splits, *,
-    kv_num_stages=3, waves_per_eu=1, pipelined=False, pv_load_depth=1, stream=None,
+    kv_num_stages=3, waves_per_eu=1, pipelined=False, pv_load_depth=1,
+    partial_bf16=False, stream=None,
 ):
     """Launch native H64 page64 MLA without packing Q or KV.
 
-    S1 writes BF16 output. Split launches write normalized FP32 partials and
-    natural-log LSE for ``flydsl_mla_decode_reduce``. Buffers are caller-owned.
+    S1 writes BF16 output. Split launches write normalized partials (FP32, or
+    BF16 when ``partial_bf16``) and FP32 natural-log LSE for
+    ``flydsl_mla_decode_reduce``. Any positive split count is valid; splits
+    own balanced contiguous page ranges. Buffers are caller-owned.
     ``pipelined=False`` is the fully waited diagnostic schedule.
     """
     _require(str(get_rocm_arch()).split(":", 1)[0] == "gfx1250", "expected gfx1250")
@@ -571,7 +574,8 @@ def flydsl_mla_pagesize64_fp8_fp8_ring(
     _require_layout("kv_scale", kv_scale, torch.float32, (1,))
     _require_layout("split_lse", split_lse, torch.float32, (batch, num_splits, 64, 1))
     shape = (batch, 64, 512) if num_splits == 1 else (batch, num_splits, 64, 512)
-    _require_layout("split_data", split_data, torch.bfloat16 if num_splits == 1 else torch.float32, shape)
+    mode = 0 if num_splits == 1 else (2 if partial_bf16 else 1)
+    _require_layout("split_data", split_data, torch.float32 if mode == 1 else torch.bfloat16, shape)
     _require(all(t.device == q.device for t in (split_data, split_lse, kv, block_tables, seqused_k, q_scale, kv_scale)), "all tensors must be on q.device")
     from flydsl.compiler.kernel_function import CompilationContext
     from .kernels.mla_gfx1250.mla_pagesize64_fp8_fp8_ring import launch_mla_pagesize64_fp8_fp8_ring
@@ -581,13 +585,13 @@ def flydsl_mla_pagesize64_fp8_fp8_ring(
     with CompilationContext.compile_hints({"waves_per_eu": (waves_per_eu, waves_per_eu) if waves_per_eu else 0}):
         _run_compiled(
             launch_mla_pagesize64_fp8_fp8_ring,
-            ptr_arg(split_data, fx.Float32 if num_splits > 1 else fx.BFloat16),
+            ptr_arg(split_data, fx.Float32 if mode == 1 else fx.BFloat16),
             ptr_arg(split_lse, fx.Float32), ptr_arg(q, fx.Int8), ptr_arg(kv, fx.Int8),
             ptr_arg(block_tables, fx.Int32), ptr_arg(seqused_k, fx.Int32),
             ptr_arg(q_scale, fx.Float32), ptr_arg(kv_scale, fx.Float32),
             float(softmax_scale), batch, num_splits, block_tables.shape[1],
-            int(num_splits > 1), kv_num_stages, int(bool(pipelined)), pv_load_depth, stream,
-            specialization_key=(int(num_splits > 1), kv_num_stages, waves_per_eu, int(bool(pipelined)), pv_load_depth),
+            mode, kv_num_stages, int(bool(pipelined)), pv_load_depth, stream,
+            specialization_key=(mode, kv_num_stages, waves_per_eu, int(bool(pipelined)), pv_load_depth),
         )
 
 
@@ -610,13 +614,16 @@ def flydsl_mla_decode_reduce(
 
     total_tokens, _, num_heads, v_head_dim = split_data.shape
     out_dtype = "bf16" if out.dtype == torch.bfloat16 else "fp16"
-    launch = compile_mla_decode_reduce(H=num_heads, Dv=v_head_dim, out_dtype=out_dtype)
+    # BF16 partials (opt-in, native ring) are read and widened to FP32.
+    partial_bf16 = split_data.dtype == torch.bfloat16
+    hints = {"partial_dtype": "bf16"} if partial_bf16 else {}
+    launch = compile_mla_decode_reduce(H=num_heads, Dv=v_head_dim, out_dtype=out_dtype, **hints)
     if stream is None:
         stream = torch.cuda.current_stream(out.device)
     out_type = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
     _run_compiled(
         launch,
-        ptr_arg(split_data, fx.Float32),
+        ptr_arg(split_data, fx.BFloat16 if partial_bf16 else fx.Float32),
         ptr_arg(split_lse, fx.Float32),
         ptr_arg(seqused_k, fx.Int32),
         ptr_arg(out, out_type),
@@ -712,7 +719,9 @@ def flydsl_mla_decode_pagesize64_fp8_workspace(q, kv, block_tables, max_seqlen_k
         }
     buffers["lse"] = torch.empty((batch, splits, heads, 1), device=device, dtype=torch.float32)
     if splits > 1:
-        buffers["partial"] = torch.empty((batch, splits, heads, 512), device=device, dtype=torch.float32)
+        bf16 = route == "native" and schedule.get("partial_bf16", False)
+        buffers["partial"] = torch.empty((batch, splits, heads, 512), device=device,
+                                         dtype=torch.bfloat16 if bf16 else torch.float32)
     return MLADecodePagesize64Workspace(key, route, bucket, schedule, splits, buffers)
 
 

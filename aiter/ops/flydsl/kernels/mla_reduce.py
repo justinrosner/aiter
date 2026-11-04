@@ -142,6 +142,16 @@ def _load_partial_out(buf, row, head_idx, tid, vec):
     return elems
 
 
+def _load_partial_bf16(buf, row, head_idx, tid, vec):
+    """Read VEC bf16 elements from ``buf[row, head_idx, tid*VEC : +VEC]`` as fp32."""
+    reg_layout = fx.make_layout(vec, 1)
+    row_tiled = fx.logical_divide(fx.slice(buf, (row, head_idx, None)), reg_layout)
+    frag = fx.make_rmem_tensor(reg_layout, fx.BFloat16)
+    fx.copy_atom_call(_out_copy_atom(vec, fx.BFloat16), fx.slice(row_tiled, (None, tid)), frag)
+    v = frag.load()
+    return [v[i].to(fx.Float32) for i in fx.range_constexpr(vec)]
+
+
 def _out_copy_atom(vec: int, out_numeric_t):
     """Widest legal buffer copy atom for a VEC-element output fragment.
 
@@ -921,8 +931,12 @@ def compile_mla_decode_reduce(
     out_dtype: str = "bf16",
     num_threads: int = 128,
     waves_per_eu: int = _DEFAULT_WAVES_PER_EU,
+    partial_dtype: str = "fp32",
 ):
     """Compile the gfx1250 MLA decode reduce for fixed (H, Dv, out_dtype).
+
+    ``partial_dtype`` is "fp32" (default) or "bf16" for split partials; the
+    merge is always FP32 and LSE is always FP32.
 
     Takes no CSR metadata, unlike :func:`compile_mla_reduce`: split rows are
     dense (``token * num_splits + split``) and the valid split count comes from
@@ -934,6 +948,9 @@ def compile_mla_decode_reduce(
         Dv % num_threads == 0
     ), f"Dv ({Dv}) must be divisible by num_threads ({num_threads})"
     VEC = Dv // num_threads
+    assert partial_dtype in ("fp32", "bf16"), f"Unsupported partial_dtype: {partial_dtype}"
+    partial_t = fx.BFloat16 if partial_dtype == "bf16" else fx.Float32
+    load_partial = _load_partial_bf16 if partial_dtype == "bf16" else _load_partial_out
 
     kernel_value_attrs = (
         {"rocdl.waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
@@ -961,7 +978,7 @@ def compile_mla_decode_reduce(
 
         num_rows = total_tokens * num_splits
         data_buf = _pointer_buffer_tensor(
-            split_data, fx.Float32, (num_rows, H, Dv), (H * Dv, Dv, 1)
+            split_data, partial_t, (num_rows, H, Dv), (H * Dv, Dv, 1)
         )
         lse_buf = _pointer_buffer_tensor(split_lse, fx.Float32, (num_rows, H), (H, 1))
         out_buf = _pointer_buffer_tensor(
@@ -981,7 +998,7 @@ def compile_mla_decode_reduce(
 
         row_base = token_i32 * num_splits
 
-        partial0 = _load_partial_out(data_buf, row_base, head, tid, VEC)
+        partial0 = load_partial(data_buf, row_base, head, tid, VEC)
         lse0 = lse_buf[row_base, head]
         init = [partial0[i].ir_value() for i in fx.range_constexpr(VEC)]
         init += [fx.Float32(lse0).ir_value(), fx.Float32(1.0).ir_value()]
@@ -993,7 +1010,7 @@ def compile_mla_decode_reduce(
             running_sum = state[VEC + 1]
 
             row = row_base + fx.Int32(split)
-            partial = _load_partial_out(data_buf, row, head, tid, VEC)
+            partial = load_partial(data_buf, row, head, tid, VEC)
             lse = lse_buf[row, head]
 
             new_max = fx.Float32(running_max).maximumf(lse)

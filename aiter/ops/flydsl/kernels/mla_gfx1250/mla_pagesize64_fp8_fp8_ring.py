@@ -28,6 +28,12 @@ ALPHA_BYTES = 64 * 4
 EXCHANGE_BYTES = P_EXCHANGE_BYTES + ALPHA_BYTES
 
 
+def plain_barrier():
+    """Workgroup barrier without a memory fence; callers add the waits they need."""
+    rocdl_dialect.s_barrier_signal(-1)
+    rocdl_dialect.s_barrier_wait(-1)
+
+
 @flyc.jit
 def native_page_load(global_ptr: fx.Pointer, shared_ptr: fx.Pointer,
                      columns: fx.Constexpr[int], pitch: fx.Constexpr[int]):
@@ -74,7 +80,11 @@ def launch_mla_pagesize64_fp8_fp8_ring(
     pv_load_depth: fx.Constexpr[int] = 1,
     stream: fx.Stream = fx.Stream(None),
 ):
-    """H64 native MLA; diagnostic or separately waited ordinary ring."""
+    """H64 native MLA; diagnostic or separately waited ordinary ring.
+
+    split_output: 0 = BF16 final output (one split), 1 = normalized FP32
+    partials, 2 = normalized BF16 partials. LSE is always FP32.
+    """
     assert stages in (3, 4)
     assert pv_load_depth in (1, 4, 8)
     prefetch = stages - 1
@@ -163,16 +173,21 @@ def launch_mla_pagesize64_fp8_fp8_ring(
         def consume(tile_index, slot, state, fill=False, lora_wait=0, rope_wait=0, masked=True):
             tile_index = fx.Int32(tile_index)
             slot = fx.Int32(slot)
+            # LoRA visible to all waves, and every wave's earlier LDS reads are
+            # complete, so the refill below may overwrite the previous slot.
             tdm_ops.tensor_wait(lora_wait)
-            gpu.barrier()
+            rocdl.s_wait_dscnt(0)
+            plain_barrier()
             scores = qk_part(slot, [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(4)])
             if const_expr(fill):
                 # Every wave finished the previous iteration's PV reads before
                 # the barrier above, so the refill slot is free.
                 future = tile_index + prefetch
                 issue(first_page + future, (slot + prefetch) % stages)
+            # RoPE visibility only: no LDS location is rewritten here, so the
+            # LoRA K reads in flight need no drain.
             tdm_ops.tensor_wait(rope_wait)
-            gpu.barrier()
+            plain_barrier()
             scores = qk_part(slot, scores, rope=True)
             old_max = fx.Float32(state[0])
             old_sum = fx.Float32(state[1])
@@ -290,20 +305,20 @@ def launch_mla_pagesize64_fp8_fp8_ring(
             output_scales = [fx.Float32(Vec(load32(shared_idx, alpha_base + (m * 16 + row) * 4)).bitcast(fx.Float32)[0]) for m in range_constexpr(4)]
             # Reclaim the dead ring as one packed [64 heads, 128 columns] tile
             # per wave; TDM cannot remove padding.
-            element_bytes = 4 if split_output else 2
+            element_bytes = 4 if split_output == 1 else 2
             tile_base = wave * 64 * 128 * element_bytes
             for m in range_constexpr(4):
                 for j in range_constexpr(8):
                     values = Vec(final[2 + m * 8 + j]) * output_scales[m]
                     offset = tile_base + ((m * 16 + row) * 128 + j * 16 + half * 8) * element_bytes
-                    if const_expr(split_output):
+                    if const_expr(split_output == 1):
                         for chunk in range_constexpr(2):
                             store128(shared_idx, offset + chunk * 16, Vec.from_elements([values[chunk * 4 + i] for i in range_constexpr(4)], fx.Float32).bitcast(fx.Int32))
                     else:
                         store128(shared_idx, offset, values.to(fx.BFloat16).bitcast(fx.Int32))
             rocdl.s_wait_dscnt(0)
             gpu.barrier()
-            output_type = fx.Float32 if split_output else fx.BFloat16
+            output_type = fx.Float32 if split_output == 1 else fx.BFloat16
             typed_output = fx.recast_iter(fx.PointerType.get(output_type.ir_type, output.memspace, 16), output)
             typed_shared = fx.recast_iter(fx.PointerType.get(output_type.ir_type, shared.memspace, 16), shared)
             base = (fx.Int64(seq) * splits + segment) * 64 * 512 if split_output else fx.Int64(seq) * 64 * 512

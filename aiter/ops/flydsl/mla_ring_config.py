@@ -20,7 +20,7 @@ _CONFIG_ROOT = Path(__file__).parent / "configs" / "mla"
 _CONTRACT = "native-h64-fp8-page64-q576-kv576-natural-lse-v2"
 _SCHEMA = 2
 _AXES = ("H", "B", "KV")
-_CONFIG_KEYS = {"num_splits", "kv_num_stages", "waves_per_eu", "pipelined", "pv_load_depth"}
+_CONFIG_KEYS = {"num_splits", "kv_num_stages", "waves_per_eu", "pipelined", "pv_load_depth", "partial_bf16"}
 _TOP_KEYS = {"schema", "contract", "arch", "cu_num", "implementation_sha256", "buckets",
              "evidence", "selection_scope"}
 _LOG = logging.getLogger(__name__)
@@ -29,10 +29,11 @@ _WARNED = set()
 
 
 def implementation_hash():
-    """SHA-256 of the ring kernel source and the helper sources it imports."""
+    """SHA-256 of the ring kernel, its helper sources and the split reducer."""
     kernel = Path(__file__).parent / "kernels" / "mla_gfx1250" / "mla_pagesize64_fp8_fp8_ring.py"
     digest = hashlib.sha256(kernel.read_bytes())
-    for dependency in (kernel.parent / "mla_common.py", kernel.parent.parent / "gemm_common_gfx1250.py"):
+    for dependency in (kernel.parent / "mla_common.py", kernel.parent.parent / "gemm_common_gfx1250.py",
+                       kernel.parent.parent / "mla_reduce.py"):
         digest.update(dependency.read_bytes())
     return digest.hexdigest()
 
@@ -60,7 +61,8 @@ def _validate_entry(key, entry):
     if not entry:
         return
     if (set(entry) != _CONFIG_KEYS
-            or entry["num_splits"] not in (1, 2, 4, 8, 16, 32, 64)
+            or type(entry["num_splits"]) is not int or not 1 <= entry["num_splits"] <= 64
+            or type(entry["partial_bf16"]) is not bool
             or entry["kv_num_stages"] not in (3, 4)
             or entry["waves_per_eu"] not in (1, 2)
             or entry["pv_load_depth"] not in (1, 4, 8)
