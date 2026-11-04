@@ -88,6 +88,10 @@ class MLAConfig:
     USE_LDS_PIPELINE: gl.constexpr
     Q_FROM_LDS: gl.constexpr
     P_SHARED_LAYOUT: gl.constexpr
+    P_XCHG_LAYOUT: gl.constexpr
+    ALPHA_XCHG_LAYOUT: gl.constexpr
+    RING_INTERLEAVE_PV: gl.constexpr
+    XCHG_MODE: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -119,9 +123,13 @@ class MLAConfig:
         KV_ROW_PAD=8,
         Q_FROM_LDS=False,
         Q_ROW_PAD=8,
+        RING_INTERLEAVE_PV=False,
+        XCHG_MODE=0,
     ):
         self.USE_LDS_PIPELINE = gl.constexpr(USE_LDS_PIPELINE)
         self.Q_FROM_LDS = gl.constexpr(Q_FROM_LDS)
+        self.RING_INTERLEAVE_PV = gl.constexpr(RING_INTERLEAVE_PV)
+        self.XCHG_MODE = gl.constexpr(XCHG_MODE)
         # Constants
         self.KV_LORA_RANK = gl.constexpr(KV_LORA_RANK)
         self.QK_ROPE_HEAD_DIM = gl.constexpr(QK_ROPE_HEAD_DIM)
@@ -501,6 +509,29 @@ class MLAConfig:
                     [64, 0],
                 ]
             )
+        )
+
+        # XCHG_MODE=1: LDS layouts for the alpha and P exchange of one ring tile.
+        self.P_XCHG_LAYOUT = gl.constexpr(
+            gl.SharedLinearLayout(
+                [
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 16],
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [0, 8],
+                    [0, 32],
+                ]
+            )
+        )
+        self.ALPHA_XCHG_LAYOUT = gl.constexpr(
+            gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
         )
 
         self.q_cache_modifier = gl.constexpr(".cg")
@@ -1681,10 +1712,82 @@ class MLAProgram:
             S = gl.where(pos[None, :] < seq_len, S, float("-inf"))
 
         p, alpha, M = self.softmax_part0(S, M)
-        p, L, acc = self.softmax_part1(p, L, acc, alpha)
-        v = self.lds_unshuffle_kv_lora_trans(buffer_id).load(cfg.V_DOT_LAYOUT)
-        acc = self.compute_pkv_lora_trans(p, v, None, acc)
+        if cfg.XCHG_MODE == 1:
+            # Write alpha and P to two LDS buffers, then read both after one
+            # barrier. This removes the barriers of the shared conversion scratch.
+            L = L * alpha + gl.sum(p, 1)
+            v = self.lds_unshuffle_kv_lora_trans(buffer_id).load(cfg.V_DOT_LAYOUT)
+            p8 = p.to(v.dtype)
+            a_s = gl.allocate_shared_memory(
+                gl.float32, [cfg.BLOCK_M], cfg.ALPHA_XCHG_LAYOUT, alpha
+            )
+            p_s = gl.allocate_shared_memory(
+                p8.dtype, [cfg.BLOCK_M, cfg.TILE_SIZE], cfg.P_XCHG_LAYOUT, p8
+            )
+            alpha_pv = a_s.load(gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
+            acc = acc * alpha_pv[:, None]
+            acc = gl.amd.gfx1250.wmma(p_s.load(cfg.P_DOT_LAYOUT), v, acc)
+        else:
+            p, L, acc = self.softmax_part1(p, L, acc, alpha)
+            v = self.lds_unshuffle_kv_lora_trans(buffer_id).load(cfg.V_DOT_LAYOUT)
+            acc = self.compute_pkv_lora_trans(p, v, None, acc)
         return L, M, acc
+
+    @gluon.jit
+    def process_ring_tile_interleaved(
+        self,
+        buffer_id,
+        tile_idx,
+        qk_factor,
+        seq_len,
+        L,
+        M,
+        acc,
+        pending_p,
+        pending_slot,
+        pending_valid,
+        fill_row,
+        fill_slot,
+        LORA_WAIT: gl.constexpr,
+        ROPE_WAIT: gl.constexpr,
+        FILL: gl.constexpr,
+        IS_LAST: gl.constexpr,
+    ):
+        cfg = self.cfg
+        S = gl.zeros(
+            [cfg.BLOCK_M, cfg.TILE_SIZE],
+            dtype=tl.float32,
+            layout=cfg.QK_WMMA_UNPACKED_LAYOUT,
+        )
+        k_lora = self.tdm_shared_load_kv_lora(LORA_WAIT, buffer_id)
+        S = self.compute_qk_lora(k_lora, None, None, S)
+        # Consume the previous V before refill, and before the next alpha rescale.
+        if pending_valid:
+            v = self.lds_unshuffle_kv_lora_trans(pending_slot).load(cfg.V_DOT_LAYOUT)
+            acc = self.compute_pkv_lora_trans(pending_p, v, None, acc)
+        if FILL:
+            self.tdm_load_global_to_shared_kv_lora(fill_row, fill_slot)
+            self.tdm_load_global_to_shared_k_rope(fill_row, fill_slot)
+        k_rope = self.tdm_shared_load_k_rope(ROPE_WAIT, buffer_id)
+        S = self.compute_qk_rope(k_rope, None, None, S) * qk_factor
+
+        if IS_LAST:
+            pos = tile_idx * cfg.TILE_SIZE + gl.arange(
+                0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
+            )
+            S = gl.where(pos[None, :] < seq_len, S, float("-inf"))
+
+        p, alpha, M = self.softmax_part0(S, M)
+        p, L, acc = self.softmax_part1(p, L, acc, alpha)
+        # Keep only the FP8 probabilities live across the tile boundary.
+        return (
+            L,
+            M,
+            acc,
+            p.to(gl.float8e4nv),
+            buffer_id,
+            gl.full((), True, gl.int1, gl.BlockedLayout([1], [32], [4], [0])),
+        )
 
 
 @gluon.jit
@@ -1956,6 +2059,105 @@ def _mla_decode_kv_ring(
     return L, M, acc
 
 
+@gluon.jit
+def _mla_decode_kv_ring_interleaved(
+    pgm: MLAProgram,
+    block_tables_ptr_shifted,
+    j_hbm_start,
+    seq_len,
+    qk_factor,
+    NUM_STAGES: gl.constexpr,
+):
+    # Keeps NUM_STAGES - 1 tiles of this segment in flight. Each tile is two
+    # TDM loads, LoRA then RoPE, and the wait counts below rely on that order.
+    # Like the two-stage loop, a tile waits for its LoRA, issues the next fill
+    # behind the LoRA QK, then waits for its RoPE.
+    PREFETCH: gl.constexpr = NUM_STAGES - 1
+    num_tiles = pgm.tile_end - pgm.tile_start
+    # Prime unconditionally, re-reading the last tile in a short segment: the
+    # wait-count pass takes the minimum over all paths, and a skipped prime
+    # would lower every wait in the loop to zero.
+    for prime in gl.static_range(PREFETCH):
+        _, page = pgm.load_physical_block_idx_with_mod(
+            prime, block_tables_ptr_shifted, j_hbm_start, num_tiles
+        )
+        row = pgm.get_kv_buffer_row_offsets(page)
+        pgm.tdm_load_global_to_shared_kv_lora(row, prime)
+        pgm.tdm_load_global_to_shared_k_rope(row, prime)
+
+    L, M, acc = pgm.allocate_accumulator()
+    pending_p = gl.zeros(
+        [pgm.cfg.BLOCK_M, pgm.cfg.TILE_SIZE],
+        gl.float8e4nv,
+        pgm.cfg.QK_WMMA_UNPACKED_LAYOUT,
+    )
+    pending_slot: gl.int32 = 0
+    pending_valid = gl.full((), False, gl.int1, gl.BlockedLayout([1], [32], [4], [0]))
+    slot: gl.int32 = 0
+    _, page = pgm.load_physical_block_idx_with_mod(
+        PREFETCH, block_tables_ptr_shifted, j_hbm_start, num_tiles
+    )
+    for tile in range(num_tiles - PREFETCH):
+        # The slot being refilled was consumed by the previous tile.
+        fill_slot = (slot + PREFETCH) % NUM_STAGES
+        row = pgm.get_kv_buffer_row_offsets(page)
+        _, page = pgm.load_physical_block_idx_with_mod(
+            tile + PREFETCH + 1, block_tables_ptr_shifted, j_hbm_start, num_tiles
+        )
+        L, M, acc, pending_p, pending_slot, pending_valid = (
+            pgm.process_ring_tile_interleaved(
+                slot,
+                pgm.tile_start + tile,
+                qk_factor,
+                seq_len,
+                L,
+                M,
+                acc,
+                pending_p,
+                pending_slot,
+                pending_valid,
+                row,
+                fill_slot,
+                LORA_WAIT=2 * PREFETCH - 1,
+                ROPE_WAIT=2 * PREFETCH,
+                FILL=True,
+                IS_LAST=False,
+            )
+        )
+        slot = (slot + 1) % NUM_STAGES
+
+    # Drain the last PREFETCH tiles, or all of them in a shorter segment. Step k
+    # starts with PREFETCH - k tiles in flight either way.
+    for k in gl.static_range(PREFETCH):
+        tile = num_tiles - PREFETCH + k
+        if tile >= 0:
+            L, M, acc, pending_p, pending_slot, pending_valid = (
+                pgm.process_ring_tile_interleaved(
+                    slot,
+                    pgm.tile_start + tile,
+                    qk_factor,
+                    seq_len,
+                    L,
+                    M,
+                    acc,
+                    pending_p,
+                    pending_slot,
+                    pending_valid,
+                    0,
+                    0,
+                    LORA_WAIT=2 * (PREFETCH - k) - 1,
+                    ROPE_WAIT=2 * (PREFETCH - 1 - k),
+                    FILL=False,
+                    IS_LAST=(k == PREFETCH - 1),
+                )
+            )
+            slot = (slot + 1) % NUM_STAGES
+    if pending_valid:
+        v = pgm.lds_unshuffle_kv_lora_trans(pending_slot).load(pgm.cfg.V_DOT_LAYOUT)
+        acc = pgm.compute_pkv_lora_trans(pending_p, v, None, acc)
+    return L, M, acc
+
+
 _mla_decode_fwd_kernel_repr = make_kernel_repr(
     "_mla_decode_fwd_kernel",
     [
@@ -1975,6 +2177,8 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "KV_CACHE_DTYPE",
         "TDM_PARTIAL_STORE",
         "Q_FROM_LDS",
+        "RING_INTERLEAVE_PV",
+        "XCHG_MODE",
     ],
 )
 
@@ -2031,6 +2235,8 @@ def _mla_decode_fwd_kernel(
     output_stride_1: gl.int32 = 0,
     TDM_PARTIAL_STORE: gl.constexpr = 0,
     Q_FROM_LDS: gl.constexpr = 0,
+    RING_INTERLEAVE_PV: gl.constexpr = False,
+    XCHG_MODE: gl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2068,7 +2274,18 @@ def _mla_decode_fwd_kernel(
         KV_ROW_PAD,
         Q_FROM_LDS,
         Q_ROW_PAD,
+        RING_INTERLEAVE_PV,
+        XCHG_MODE,
     )
+
+    if RING_INTERLEAVE_PV:
+        gl.static_assert(ALL_DECODE and not SHUFFLED_KV_CACHE)
+        gl.static_assert(QUERY_DTYPE == "fp8" and KV_CACHE_DTYPE == "fp8")
+        gl.static_assert(KV_LORA_RANK == 512 and QK_ROPE_HEAD_DIM == 64)
+        gl.static_assert(TILE_SIZE == 64 and BLOCK_M == 64 and BLOCK_Q == 1)
+        gl.static_assert(num_query_heads == 64 and num_kv_heads == 1)
+        gl.static_assert(num_warps == 4 and num_stages == 3 and Q_FROM_LDS == 1)
+        gl.static_assert(not USE_LDS_PIPELINE)
 
     if USE_LDS_PIPELINE:
         gl.static_assert(ALL_DECODE and SHUFFLED_KV_CACHE)
@@ -2397,7 +2614,16 @@ def _mla_decode_fwd_kernel(
         )
         return
 
-    if num_stages > 2:
+    if RING_INTERLEAVE_PV:
+        L, M, acc = _mla_decode_kv_ring_interleaved(
+            pgm,
+            block_tables_ptr_shifted,
+            segm_idx * tiles_per_segment,
+            seq_len,
+            qk_factor,
+            num_stages,
+        )
+    elif num_stages > 2:
         L, M, acc = _mla_decode_kv_ring(
             pgm,
             block_tables_ptr_shifted,

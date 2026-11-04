@@ -13,7 +13,13 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ..gemm_common_gfx1250 import make_lds_copy_ops
-from ..tensor_shim import buf_copy_atom, buf_load_scalar, ptr_buf_tensor, ptr_rsrc
+from ..tensor_shim import (
+    buf_copy_atom,
+    buf_copy_store,
+    buf_load_scalar,
+    ptr_buf_tensor,
+    ptr_rsrc,
+)
 from .mla_common import (
     _concat_ds_tr8_b64,
     _concat_wmma_operand,
@@ -105,7 +111,34 @@ def launch_mla_pagesize64_fp8_fp8(
     num_splits: fx.Int32,
     out_16_nosplit: fx.Constexpr[int],
     stream: fx.Stream = _DEFAULT_STREAM,
+    num_q_heads: fx.Constexpr[int] = 128,
+    q_head_stride: fx.Constexpr[int] = 768,
+    compact_ring: fx.Constexpr[int] = 0,
+    kv_num_stages: fx.Constexpr[int] = 5,
+    q_from_lds: fx.Constexpr[int] = 0,
+    pv_load_depth: fx.Constexpr[int] = 8,
+    q_load_depth: fx.Constexpr[int] = 0,
+    q_lds_pitch: fx.Constexpr[int] = 576,
 ):
+    NUM_Q_HEADS = num_q_heads
+    NUM_HEAD_GROUPS = max(1, num_q_heads // HEADS_PER_GROUP)
+    Q_HEAD_STRIDE = q_head_stride
+    Q_ROW_STRIDE = num_q_heads * q_head_stride
+    Q_GROUP_STRIDE = HEADS_PER_GROUP * q_head_stride
+    Q_WAVE_STRIDE = HEADS_PER_WAVE * q_head_stride
+    PV_D_TILES = 8 if num_q_heads == 8 else 32
+    if compact_ring:
+        assert kv_num_stages in (3, 4)
+    else:
+        assert kv_num_stages == 5 and not q_from_lds
+    PV_LOAD_DEPTH = min(pv_load_depth, PV_D_TILES)
+    KV_NUM_STAGES = kv_num_stages
+    KV_PREFETCH = kv_num_stages - 1 if compact_ring else 3
+    KV_ROPE_STAGE_BASE = kv_num_stages * KV_STAGE_BYTES if compact_ring else 0xC800
+    Q_LDS_BASE = KV_ROPE_STAGE_BASE + kv_num_stages * KV_ROPE_STAGE_BYTES
+    # Each wave owns its KV ring and Q rows. Output staging reuses the dead ring.
+    LDS_WAVE_BYTES = (Q_LDS_BASE + (16 * q_lds_pitch if q_from_lds else 0)) if compact_ring else 0x10000
+    LDS_TOTAL_BYTES = NUM_WAVES * LDS_WAVE_BYTES
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -157,16 +190,20 @@ def launch_mla_pagesize64_fp8_fp8(
         _, batch_id, z = fx.block_idx
         batch_i32 = fx.Int32(batch_id)
 
-        head_group = z & 1
-        split_id = z >> 1
+        head_group = z % NUM_HEAD_GROUPS
+        split_id = z // NUM_HEAD_GROUPS
         wave_id = rocdl.readfirstlane(T.i32, tid >> 5)
         lane_id = tid & (WAVE_SIZE - 1)
         head_in_wave = lane_id & (HEADS_PER_WAVE - 1)
         lane_half = lane_id >> 4
         head = head_group * HEADS_PER_GROUP + wave_id * HEADS_PER_WAVE + head_in_wave
+        pv_dim_base = fx.Int32(0)
+        if const_expr(NUM_Q_HEADS == 8):
+            head = head_in_wave
+            pv_dim_base = wave_id * 128
 
         def lds_segment_byte(slot):
-            return (wave_id * LDS_WAVE_BYTES) ^ (slot * LDS_WAVE_BYTES)
+            return (wave_id ^ slot) * LDS_WAVE_BYTES
 
         def lds_segment_token_base(slot):
             return (wave_id ^ slot) * HEADS_PER_WAVE
@@ -181,6 +218,10 @@ def launch_mla_pagesize64_fp8_fp8(
 
         q_unit_base = fx.Int32(q_tile_base >> 4)
         q_head_dwords = head_in_wave * (Q_HEAD_STRIDE // 4)
+        if const_expr(NUM_Q_HEADS == 8):
+            q_unit_base = fx.Int32(q_row_base >> 4)
+            # Inactive WMMA rows use an in-range address, then zero the registers.
+            q_head_dwords = (head_in_wave & 7) * (Q_HEAD_STRIDE // 4)
         q_lane_dwords = q_head_dwords + lane_half * 4
 
         def load_q_b128(dword_offset):
@@ -189,20 +230,34 @@ def launch_mla_pagesize64_fp8_fp8(
                 fx.slice(q_t, (q_unit_base + dword_offset // 4, None)),
                 q_frag,
             )
-            return q_frag.load()
+            values = Vec(q_frag.load())
+            if const_expr(NUM_Q_HEADS == 8):
+                values = Vec.from_elements(
+                    [
+                        (head_in_wave < 8).select(values[i], fx.Int32(0))
+                        for i in range_constexpr(4)
+                    ],
+                    fx.Int32,
+                )
+            return values
 
         q_nope_chunks = []
-        for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
-            q_nope_chunks.append(
-                [
-                    Vec(load_q_b128(q_lane_dwords + k_fragment * 32 + chunk * 8))
-                    for chunk in range_constexpr(4)
-                ]
-            )
-        q_rope_chunks = [
-            Vec(load_q_b128(q_lane_dwords + QK_NOPE_HEAD_DIM // 4 + chunk * 8))
-            for chunk in range_constexpr(2)
-        ]
+        q_rope_chunks = []
+        if const_expr(q_from_lds):
+            q_lds_row = wave_id * LDS_WAVE_BYTES + Q_LDS_BASE + head_in_wave * q_lds_pitch
+            for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
+                for chunk in range_constexpr(4):
+                    q_chunk = load_q_b128(q_lane_dwords + k_fragment * 32 + chunk * 8)
+                    lds_store_b128(lds_base_idx, q_lds_row + k_fragment * 128 + lane_half * 16 + chunk * 32, q_chunk)
+            for chunk in range_constexpr(2):
+                q_chunk = load_q_b128(q_lane_dwords + QK_NOPE_HEAD_DIM // 4 + chunk * 8)
+                lds_store_b128(lds_base_idx, q_lds_row + 512 + lane_half * 16 + chunk * 32, q_chunk)
+            rocdl.s_wait_dscnt(0)
+            gpu.barrier()
+        else:
+            for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
+                q_nope_chunks.append([Vec(load_q_b128(q_lane_dwords + k_fragment * 32 + chunk * 8)) for chunk in range_constexpr(4)])
+            q_rope_chunks = [Vec(load_q_b128(q_lane_dwords + QK_NOPE_HEAD_DIM // 4 + chunk * 8)) for chunk in range_constexpr(2)]
 
         rope_row = lane_id >> 2
         rope_chunk = lane_id & 3
@@ -311,24 +366,16 @@ def launch_mla_pagesize64_fp8_fp8(
             issue_kv_page(_page_id(split_page_begin), fx.Int32(0))
             if second_page < page_end:
                 issue_kv_page(_page_id(second_page), fx.Int32(1))
-            if third_page < page_end:
-                issue_kv_page(_page_id(third_page), fx.Int32(2))
-
-        q_nope_fragments = q_nope_chunks
-        q_rope_fragment = q_rope_chunks
+            if const_expr(KV_PREFETCH == 3):
+                if third_page < page_end:
+                    issue_kv_page(_page_id(third_page), fx.Int32(2))
 
         q_nope_operands = []
-        for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
-            q_nope_operands.append(
-                _rmem_i32(
-                    Q_NOPE_FRAGMENT_DWORDS,
-                    _concat_wmma_operand(q_nope_fragments[k_fragment]),
-                )
-            )
-        q_rope_operand = _rmem_i32(
-            Q_ROPE_FRAGMENT_DWORDS,
-            _concat_wmma_operand_k64(q_rope_fragment),
-        )
+        q_rope_operand = None
+        if const_expr(not q_from_lds):
+            for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
+                q_nope_operands.append(_rmem_i32(Q_NOPE_FRAGMENT_DWORDS, _concat_wmma_operand(q_nope_chunks[k_fragment])))
+            q_rope_operand = _rmem_i32(Q_ROPE_FRAGMENT_DWORDS, _concat_wmma_operand_k64(q_rope_chunks))
 
         def compute_pending_pv(
             running_outs,
@@ -370,6 +417,7 @@ def launch_mla_pagesize64_fp8_fp8(
                         + pending_stage * KV_STAGE_BYTES
                         + v_row * Q_LDS_ROW_BYTES
                         + v_col
+                        + pv_dim_base
                         + dv_tile * 16
                     )
                     v_ptr = fx.add_offset(lds_base, v_byte_offset)
@@ -436,19 +484,23 @@ def launch_mla_pagesize64_fp8_fp8(
             ]
         )
 
+        if const_expr(compact_ring):
+            init_state = [negative_inf, fx.Float32(0.0)] + [zero_out for _ in range_constexpr(PV_D_TILES)]
+
         def pipeline_step(
             page_iter, state, mask_last=True, pv_masked=None, pv_pending=False
         ):
             running_max = fx.Float32(state[0])
             running_sum = fx.Float32(state[1])
             running_outs = [Vec(state[2 + i]) for i in range_constexpr(PV_D_TILES)]
-            pending_base = 2 + PV_D_TILES
-            pending_alpha = fx.Float32(state[pending_base])
-            pending_meta = Vec(state[pending_base + 1])
-            pending_stage = fx.Int32(pending_meta[0])
-            pending_valid_len = fx.Int32(pending_meta[1])
-            pending_valid = fx.Int32(pending_meta[2])
-            pending_probability_words = Vec(state[pending_base + 2])
+            if const_expr(not compact_ring):
+                pending_base = 2 + PV_D_TILES
+                pending_alpha = fx.Float32(state[pending_base])
+                pending_meta = Vec(state[pending_base + 1])
+                pending_stage = fx.Int32(pending_meta[0])
+                pending_valid_len = fx.Int32(pending_meta[1])
+                pending_valid = fx.Int32(pending_meta[2])
+                pending_probability_words = Vec(state[pending_base + 2])
 
             page_pos = fx.Int32(page_iter)
             if const_expr(mask_last):
@@ -463,10 +515,10 @@ def launch_mla_pagesize64_fp8_fp8(
             kv_stage = page_iteration % KV_NUM_STAGES
             next_page = page_pos + num_splits
             second_next_page = page_pos + num_splits * 2
-            future_page = page_pos + num_splits * 3
+            future_page = page_pos + num_splits * KV_PREFETCH
             wait_kv_page(
                 next_page < page_end,
-                second_next_page < page_end,
+                (second_next_page < page_end) if const_expr(KV_PREFETCH == 3) else fx.Int32(0) != 0,
             )
             rocdl.s_barrier_signal(-1)
 
@@ -476,26 +528,38 @@ def launch_mla_pagesize64_fp8_fp8(
                 qk_acc.store(fx.constant_vector(0.0, T.vec(QK_ACC_DWORDS, T.f32)))
                 qk_accs.append(qk_acc)
             pv_ready_outs = running_outs
-            if const_expr(pv_pending):
-                pv_ready_outs = compute_pending_pv(
-                    running_outs,
-                    pending_alpha,
-                    pending_stage,
-                    pending_valid_len,
-                    pending_probability_words,
-                    False if pv_masked is None else pv_masked,
-                )
-            elif pending_valid != 0:
-                if const_expr(pv_masked is None):
-                    if pending_valid_len == fx.Int32(PAGE_SIZE):
+            if const_expr(not compact_ring):
+                if const_expr(pv_pending):
+                    # The first iteration has no deferred PV; LDS can contain NaNs.
+                    if pending_valid != 0:
                         pv_ready_outs = compute_pending_pv(
                             running_outs,
                             pending_alpha,
                             pending_stage,
                             pending_valid_len,
                             pending_probability_words,
-                            False,
+                            False if pv_masked is None else pv_masked,
                         )
+                elif pending_valid != 0:
+                    if const_expr(pv_masked is None):
+                        if pending_valid_len == fx.Int32(PAGE_SIZE):
+                            pv_ready_outs = compute_pending_pv(
+                                running_outs,
+                                pending_alpha,
+                                pending_stage,
+                                pending_valid_len,
+                                pending_probability_words,
+                                False,
+                            )
+                        else:
+                            pv_ready_outs = compute_pending_pv(
+                                running_outs,
+                                pending_alpha,
+                                pending_stage,
+                                pending_valid_len,
+                                pending_probability_words,
+                                True,
+                            )
                     else:
                         pv_ready_outs = compute_pending_pv(
                             running_outs,
@@ -503,17 +567,8 @@ def launch_mla_pagesize64_fp8_fp8(
                             pending_stage,
                             pending_valid_len,
                             pending_probability_words,
-                            True,
+                            pv_masked,
                         )
-                else:
-                    pv_ready_outs = compute_pending_pv(
-                        running_outs,
-                        pending_alpha,
-                        pending_stage,
-                        pending_valid_len,
-                        pending_probability_words,
-                        pv_masked,
-                    )
             rocdl.s_barrier_wait(-1)
 
             def issue_k_tile_loads(n_tile):
@@ -557,46 +612,90 @@ def launch_mla_pagesize64_fp8_fp8(
                     )
                 return k_fragment_groups, k_rope_fragment
 
-            pending_k_tile = issue_k_tile_loads(0)
-            for n_tile in range_constexpr(QK_N_TILES):
-                k_fragment_groups, k_rope_fragment = pending_k_tile
-                if const_expr(n_tile + 1 < QK_N_TILES):
-                    pending_k_tile = issue_k_tile_loads(n_tile + 1)
-                    inflight_next = QK_TILE_DS_OPS
-                else:
-                    pending_k_tile = None
-                    inflight_next = 0
+            if const_expr(q_from_lds and q_load_depth > 0):
+                def issue_operand_group(n_tile, k_fragment):
+                    k_offset = lds_segment_byte(n_tile) + kv_stage * KV_STAGE_BYTES + head_in_wave * Q_LDS_ROW_BYTES + k_fragment * 128 + lane_half * 16
+                    k_chunks = [Vec(lds_load_b128(lds_base_idx, k_offset + chunk * 32)) for chunk in range_constexpr(4)]
+                    q_chunks = [Vec(lds_load_b128(lds_base_idx, q_lds_row + k_fragment * 128 + lane_half * 16 + chunk * 32)) for chunk in range_constexpr(4)]
+                    return k_chunks, q_chunks
 
-                qk_acc = qk_accs[n_tile]
-                for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
-                    remaining_ds = (
-                        (Q_NOPE_FRAGMENT_COUNT - 1 - k_fragment) * 4 + 2 + inflight_next
+                for n_tile in range_constexpr(QK_N_TILES):
+                    staged_groups = {}
+                    for k_fragment in range_constexpr(q_load_depth):
+                        staged_groups[k_fragment] = issue_operand_group(n_tile, k_fragment)
+                    qk_acc = qk_accs[n_tile]
+                    for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
+                        future_fragment = k_fragment + q_load_depth
+                        if const_expr(future_fragment < Q_NOPE_FRAGMENT_COUNT):
+                            staged_groups[future_fragment] = issue_operand_group(n_tile, future_fragment)
+                            rocdl.s_wait_dscnt(q_load_depth * 8)
+                        else:
+                            rocdl.s_wait_dscnt((Q_NOPE_FRAGMENT_COUNT - 1 - k_fragment) * 8)
+                        k_chunks, q_chunks = staged_groups.pop(k_fragment)
+                        k_operand = _rmem_i32(Q_NOPE_FRAGMENT_DWORDS, _concat_wmma_operand(k_chunks))
+                        q_operand = _rmem_i32(Q_NOPE_FRAGMENT_DWORDS, _concat_wmma_operand(q_chunks))
+                        fx.gemm(qk_wmma_k128, qk_acc, k_operand, q_operand, qk_acc)
+                    k_rope_offset = lds_segment_byte(n_tile) + KV_ROPE_STAGE_BASE + kv_stage * KV_ROPE_STAGE_BYTES + head_in_wave * QK_ROPE_HEAD_DIM + lane_half * 16
+                    k_rope = [Vec(lds_load_b128(lds_base_idx, k_rope_offset + chunk * 32)) for chunk in range_constexpr(2)]
+                    q_rope = [Vec(lds_load_b128(lds_base_idx, q_lds_row + 512 + lane_half * 16 + chunk * 32)) for chunk in range_constexpr(2)]
+                    rocdl.s_wait_dscnt(0)
+                    k_operand = _rmem_i32(Q_ROPE_FRAGMENT_DWORDS, _concat_wmma_operand_k64(k_rope))
+                    q_operand = _rmem_i32(Q_ROPE_FRAGMENT_DWORDS, _concat_wmma_operand_k64(q_rope))
+                    fx.gemm(qk_wmma_k64, qk_acc, k_operand, q_operand, qk_acc)
+
+            else:
+                pending_k_tile = issue_k_tile_loads(0)
+                for n_tile in range_constexpr(QK_N_TILES):
+                    k_fragment_groups, k_rope_fragment = pending_k_tile
+                    if const_expr(n_tile + 1 < QK_N_TILES):
+                        pending_k_tile = issue_k_tile_loads(n_tile + 1)
+                        inflight_next = QK_TILE_DS_OPS
+                    else:
+                        pending_k_tile = None
+                        inflight_next = 0
+
+                    qk_acc = qk_accs[n_tile]
+                    for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
+                        remaining_ds = (
+                            (Q_NOPE_FRAGMENT_COUNT - 1 - k_fragment) * 4 + 2 + inflight_next
+                        )
+                        rocdl.s_wait_dscnt(remaining_ds)
+                        k_operand = _rmem_i32(
+                            Q_NOPE_FRAGMENT_DWORDS,
+                            _concat_wmma_operand(k_fragment_groups[k_fragment]),
+                        )
+                        q_operand = None
+                        if const_expr(q_from_lds):
+                            q_chunks = [Vec(lds_load_b128(lds_base_idx, q_lds_row + k_fragment * 128 + lane_half * 16 + chunk * 32)) for chunk in range_constexpr(4)]
+                            rocdl.s_wait_dscnt(0)
+                            q_operand = _rmem_i32(Q_NOPE_FRAGMENT_DWORDS, _concat_wmma_operand(q_chunks))
+                        else:
+                            q_operand = q_nope_operands[k_fragment]
+                        fx.gemm(
+                            qk_wmma_k128,
+                            qk_acc,
+                            k_operand,
+                            q_operand,
+                            qk_acc,
+                        )
+
+                    rocdl.s_wait_dscnt(inflight_next)
+                    k_rope_operand = _rmem_i32(
+                        Q_ROPE_FRAGMENT_DWORDS,
+                        _concat_wmma_operand_k64(k_rope_fragment),
                     )
-                    rocdl.s_wait_dscnt(remaining_ds)
-                    k_operand = _rmem_i32(
-                        Q_NOPE_FRAGMENT_DWORDS,
-                        _concat_wmma_operand(k_fragment_groups[k_fragment]),
-                    )
+                    rope_q_operand = q_rope_operand
+                    if const_expr(q_from_lds):
+                        q_chunks = [Vec(lds_load_b128(lds_base_idx, q_lds_row + 512 + lane_half * 16 + chunk * 32)) for chunk in range_constexpr(2)]
+                        rocdl.s_wait_dscnt(0)
+                        rope_q_operand = _rmem_i32(Q_ROPE_FRAGMENT_DWORDS, _concat_wmma_operand_k64(q_chunks))
                     fx.gemm(
-                        qk_wmma_k128,
+                        qk_wmma_k64,
                         qk_acc,
-                        k_operand,
-                        q_nope_operands[k_fragment],
+                        k_rope_operand,
+                        rope_q_operand,
                         qk_acc,
                     )
-
-                rocdl.s_wait_dscnt(inflight_next)
-                k_rope_operand = _rmem_i32(
-                    Q_ROPE_FRAGMENT_DWORDS,
-                    _concat_wmma_operand_k64(k_rope_fragment),
-                )
-                fx.gemm(
-                    qk_wmma_k64,
-                    qk_acc,
-                    k_rope_operand,
-                    q_rope_operand,
-                    qk_acc,
-                )
 
             qk_acc_vectors = [
                 Vec(qk_accs[i].load()) for i in range_constexpr(QK_N_TILES)
@@ -674,27 +773,21 @@ def launch_mla_pagesize64_fp8_fp8(
                 base = word * 4
                 packed_probability_words.append(_pack_fp8x4(probabilities, base))
 
+            probability_words = Vec.from_elements(packed_probability_words, fx.Int32)
+            if const_expr(compact_ring):
+                # PV consumes this page before its ring slot can be refilled.
+                pv_ready_outs = compute_pending_pv(running_outs, alpha, kv_stage, page_valid_len, probability_words, mask_last)
+                rocdl.s_wait_dscnt(0)
+                gpu.barrier()
             if future_page < page_end:
-                future_stage = (page_iteration + 3) % KV_NUM_STAGES
+                future_stage = (page_iteration + KV_PREFETCH) % KV_NUM_STAGES
                 issue_kv_page(_page_id(future_page), future_stage)
             gpu.barrier()
-            pending_meta = Vec.from_elements(
-                [kv_stage, page_valid_len, 1],
-                fx.Int32,
-            )
-            pending_probability = Vec.from_elements(
-                packed_probability_words,
-                fx.Int32,
-            )
-            return (
-                [new_max, new_sum]
-                + pv_ready_outs
-                + [
-                    alpha,
-                    pending_meta,
-                    pending_probability,
-                ]
-            )
+            result = [new_max, new_sum] + pv_ready_outs
+            if const_expr(not compact_ring):
+                pending_meta = Vec.from_elements([kv_stage, page_valid_len, 1], fx.Int32)
+                result = result + [alpha, pending_meta, probability_words]
+            return result
 
         remaining_pages = page_end - split_page_begin
         split_page_count = (remaining_pages > fx.Int32(0)).select(
@@ -756,30 +849,31 @@ def launch_mla_pagesize64_fp8_fp8(
             output_accs = [
                 Vec(loop_results[2 + i]) for i in range_constexpr(PV_D_TILES)
             ]
-            pending_base = 2 + PV_D_TILES
-            pending_alpha = fx.Float32(loop_results[pending_base])
-            pending_meta = Vec(loop_results[pending_base + 1])
-            pending_stage = fx.Int32(pending_meta[0])
-            pending_valid_len = fx.Int32(pending_meta[1])
-            pending_probability = Vec(loop_results[pending_base + 2])
-            if pending_valid_len == fx.Int32(PAGE_SIZE):
-                output_accs = compute_pending_pv(
-                    output_accs,
-                    pending_alpha,
-                    pending_stage,
-                    pending_valid_len,
-                    pending_probability,
-                    False,
-                )
-            else:
-                output_accs = compute_pending_pv(
-                    output_accs,
-                    pending_alpha,
-                    pending_stage,
-                    pending_valid_len,
-                    pending_probability,
-                    True,
-                )
+            if const_expr(not compact_ring):
+                pending_base = 2 + PV_D_TILES
+                pending_alpha = fx.Float32(loop_results[pending_base])
+                pending_meta = Vec(loop_results[pending_base + 1])
+                pending_stage = fx.Int32(pending_meta[0])
+                pending_valid_len = fx.Int32(pending_meta[1])
+                pending_probability = Vec(loop_results[pending_base + 2])
+                if pending_valid_len == fx.Int32(PAGE_SIZE):
+                    output_accs = compute_pending_pv(
+                        output_accs,
+                        pending_alpha,
+                        pending_stage,
+                        pending_valid_len,
+                        pending_probability,
+                        False,
+                    )
+                else:
+                    output_accs = compute_pending_pv(
+                        output_accs,
+                        pending_alpha,
+                        pending_stage,
+                        pending_valid_len,
+                        pending_probability,
+                        True,
+                    )
             gpu.barrier()
             inv_page_sum = fx.Float32(rocdl.rcp(T.f32, running_sum))
             output_scale = kv_scale_t[0] * inv_page_sum
@@ -788,7 +882,44 @@ def launch_mla_pagesize64_fp8_fp8(
                 * NUM_Q_HEADS
                 + fx.Int64(head)
             ) * V_HEAD_DIM
-            if const_expr(out_16_nosplit):
+            if const_expr(NUM_Q_HEADS == 8):
+                if head < NUM_Q_HEADS:
+                    if const_expr(out_16_nosplit):
+                        r_bf16 = ptr_buf_tensor(ptr_r, fx.BFloat16)
+                        for dv_tile in range_constexpr(PV_D_TILES):
+                            for i in range_constexpr(PV_ACC_DWORDS):
+                                output_dim = (
+                                    pv_dim_base + dv_tile * 16 + lane_half * 8 + i
+                                )
+                                r_bf16[fx.Int32(output_base + output_dim)] = (
+                                    output_accs[dv_tile][i] * output_scale
+                                ).to(fx.BFloat16)
+                    else:
+                        r_vec = ptr_buf_tensor(ptr_r, fx.Float32, unit_elems=4)
+                        for dv_tile in range_constexpr(PV_D_TILES):
+                            for chunk in range_constexpr(PV_ACC_DWORDS // 4):
+                                output_dim = (
+                                    pv_dim_base
+                                    + dv_tile * 16
+                                    + lane_half * 8
+                                    + chunk * 4
+                                )
+                                values = Vec.from_elements(
+                                    [
+                                        output_accs[dv_tile][chunk * 4 + i]
+                                        * output_scale
+                                        for i in range_constexpr(4)
+                                    ],
+                                    fx.Float32,
+                                )
+                                buf_copy_store(
+                                    r_vec,
+                                    fx.Int32((output_base + output_dim) // 4),
+                                    values,
+                                    fx.Float32,
+                                    unit_elems=4,
+                                )
+            elif const_expr(out_16_nosplit):
                 for dv_tile in range_constexpr(PV_D_TILES):
                     output_values = []
                     for i in range_constexpr(PV_ACC_DWORDS):
@@ -871,7 +1002,10 @@ def launch_mla_pagesize64_fp8_fp8(
                             output_accs[dv_tile][i] * output_scale
                         )
 
-            if lane_half == fx.Int32(0):
+            write_lse = lane_half == fx.Int32(0)
+            if const_expr(NUM_Q_HEADS == 8):
+                write_lse = write_lse & (wave_id == 0) & (head < NUM_Q_HEADS)
+            if write_lse:
                 lse_offset = (
                     fx.Int64(batch_id) * fx.Int64(num_splits) + fx.Int64(split_id)
                 ) * NUM_Q_HEADS + fx.Int64(head)
