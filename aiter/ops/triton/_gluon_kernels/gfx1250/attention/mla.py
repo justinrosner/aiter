@@ -879,6 +879,47 @@ class MLAProgram:
         )
 
     @gluon.jit
+    def with_q(self, q_lora, q_rope):
+        # The same program with new Q operands. EARLY_PRIME issues the first KV
+        # loads with a program built before Q is ready, then attaches Q.
+        return MLAProgram(
+            self.cfg,
+            q_lora,
+            q_rope,
+            self.kv_lora_shared,
+            self.k_rope_shared,
+            self.kv_lora_scales_shared,
+            self.k_rope_scales_shared,
+            self.kv_buffer_ptr,
+            self.output_ptr,
+            self.segm_max_ptr,
+            self.segm_expsum_ptr,
+            self.tile_start,
+            self.tile_end,
+            self.safe_tile_end,
+            self.kv_head_idx,
+            self.context_len,
+            self.context_len_q_pos_qk,
+            self.query_pos_qk,
+            self.query_offset_0_qk,
+            self.query_offset_1_qk,
+            self.query_mask_0_qk,
+            self.query_mask_1_qk,
+            self.query_offset_0_pv,
+            self.query_offset_1_pv,
+            self.query_mask_0_pv,
+            self.query_mask_1_pv,
+            self.kv_lora_desc,
+            self.k_rope_desc,
+            self.kv_lora_scales_desc,
+            self.k_rope_scales_desc,
+            self.stride_kv_buffer_0,
+            self.stride_kv_buffer_1,
+            self.stride_kv_buffer_2,
+            self.stride_kv_buffer_3,
+        )
+
+    @gluon.jit
     def get_next_buffer_id(self, buffer_id):
         if self.cfg.NUM_STAGES == 2:
             return 1 - buffer_id
@@ -1922,6 +1963,97 @@ def _mla_decode_lds_pipeline(
 
 
 @gluon.jit
+def _mla_process_q(
+    cfg: MLAConfig,
+    Q_lora_load,
+    Q_rope_load,
+    q_lora_shared,
+    q_rope_shared,
+):
+    # Store the loaded Q to LDS and return its operands.
+    q_lora_shared.store(Q_lora_load)
+    if cfg.Q_FROM_LDS:
+        Q_lora = q_lora_shared
+    else:
+        Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
+    q_rope_shared.store(Q_rope_load)
+    if cfg.Q_FROM_LDS:
+        Q_rope = q_rope_shared
+    else:
+        Q_rope = q_rope_shared.load(layout=cfg.Q_DOT_LAYOUT)
+    return Q_lora, Q_rope
+
+
+@gluon.jit
+def _mla_load_q_regs(
+    cfg: MLAConfig,
+    query_ptr,
+    q_start_idx,
+    token_q_block_local_idx,
+    kv_head_idx,
+    head_offset,
+    query_stride_0,
+    query_stride_1,
+    num_tokens_per_seq,
+    num_query_heads,
+    Q_NO_MASK: gl.constexpr = 0,
+):
+    # Load Q from global memory straight into the WMMA operand layout. No LDS
+    # buffer, so nothing stays live beside the KV ring (EARLY_PRIME).
+    layout: gl.constexpr = cfg.Q_DOT_LAYOUT
+    m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
+    pos = token_q_block_local_idx * cfg.BLOCK_Q + m // cfg.NUM_QUERIES_PER_KV
+    head = (
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV + head_offset + m % cfg.NUM_QUERIES_PER_KV
+    )
+    d_lora = gl.arange(0, cfg.KV_LORA_RANK, layout=gl.SliceLayout(0, layout))
+    d_rope = gl.arange(0, cfg.QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, layout))
+    if Q_NO_MASK:
+        # Padding rows read a valid row instead of a masked one: no branches.
+        pos = gl.minimum(pos, num_tokens_per_seq - 1)
+        head = gl.minimum(head, num_query_heads - 1)
+        row = (q_start_idx + pos) * query_stride_0 + head * query_stride_1
+        q_lora = gl.load(query_ptr + row[:, None] + d_lora[None, :])
+        q_rope = gl.load(
+            query_ptr + row[:, None] + (cfg.KV_LORA_RANK + d_rope)[None, :]
+        )
+    else:
+        row = (q_start_idx + pos) * query_stride_0 + head * query_stride_1
+        row_mask = (pos < num_tokens_per_seq) & (head < num_query_heads)
+        q_lora = gl.load(
+            query_ptr + row[:, None] + d_lora[None, :],
+            mask=row_mask[:, None] & (d_lora[None, :] < cfg.KV_LORA_RANK),
+            other=0.0,
+        )
+        q_rope = gl.load(
+            query_ptr + row[:, None] + (cfg.KV_LORA_RANK + d_rope)[None, :],
+            mask=row_mask[:, None] & (d_rope[None, :] < cfg.QK_ROPE_HEAD_DIM),
+            other=0.0,
+        )
+    return q_lora, q_rope
+
+
+@gluon.jit
+def _mla_ring_prime(
+    pgm: MLAProgram,
+    block_tables_ptr_shifted,
+    j_hbm_start,
+    NUM_STAGES: gl.constexpr,
+):
+    # Prime unconditionally, re-reading the last tile in a short segment: the
+    # wait-count pass takes the minimum over all paths, and a skipped prime
+    # would lower every wait in the loop to zero.
+    num_tiles = pgm.tile_end - pgm.tile_start
+    for prime in gl.static_range(NUM_STAGES - 1):
+        _, page = pgm.load_physical_block_idx_with_mod(
+            prime, block_tables_ptr_shifted, j_hbm_start, num_tiles
+        )
+        row = pgm.get_kv_buffer_row_offsets(page)
+        pgm.tdm_load_global_to_shared_kv_lora(row, prime)
+        pgm.tdm_load_global_to_shared_k_rope(row, prime)
+
+
+@gluon.jit
 def _mla_decode_kv_ring(
     pgm: MLAProgram,
     block_tables_ptr_shifted,
@@ -1929,23 +2061,17 @@ def _mla_decode_kv_ring(
     seq_len,
     qk_factor,
     NUM_STAGES: gl.constexpr,
+    PRIMED: gl.constexpr = False,
 ):
+    # PRIMED: the caller already issued the prime loads (EARLY_PRIME).
     # Keeps NUM_STAGES - 1 tiles of this segment in flight. Each tile is two
     # TDM loads, LoRA then RoPE, and the wait counts below rely on that order.
     # Like the two-stage loop, a tile waits for its LoRA, issues the next fill
     # behind the LoRA QK, then waits for its RoPE.
     PREFETCH: gl.constexpr = NUM_STAGES - 1
     num_tiles = pgm.tile_end - pgm.tile_start
-    # Prime unconditionally, re-reading the last tile in a short segment: the
-    # wait-count pass takes the minimum over all paths, and a skipped prime
-    # would lower every wait in the loop to zero.
-    for prime in gl.static_range(PREFETCH):
-        _, page = pgm.load_physical_block_idx_with_mod(
-            prime, block_tables_ptr_shifted, j_hbm_start, num_tiles
-        )
-        row = pgm.get_kv_buffer_row_offsets(page)
-        pgm.tdm_load_global_to_shared_kv_lora(row, prime)
-        pgm.tdm_load_global_to_shared_k_rope(row, prime)
+    if not PRIMED:
+        _mla_ring_prime(pgm, block_tables_ptr_shifted, j_hbm_start, NUM_STAGES)
 
     L, M, acc = pgm.allocate_accumulator()
     slot: gl.int32 = 0
@@ -2020,6 +2146,8 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "TDM_PARTIAL_STORE",
         "Q_FROM_LDS",
         "XCHG_MODE",
+        "EARLY_PRIME",
+        "Q_NO_MASK",
     ],
 )
 
@@ -2077,6 +2205,8 @@ def _mla_decode_fwd_kernel(
     TDM_PARTIAL_STORE: gl.constexpr = 0,
     Q_FROM_LDS: gl.constexpr = 0,
     XCHG_MODE: gl.constexpr = 0,
+    EARLY_PRIME: gl.constexpr = 0,
+    Q_NO_MASK: gl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2086,6 +2216,12 @@ def _mla_decode_fwd_kernel(
     if Q_FROM_LDS:
         gl.static_assert(QUERY_DTYPE != "nvfp4" and KV_CACHE_DTYPE != "nvfp4")
         gl.static_assert(not USE_LDS_PIPELINE)
+    if EARLY_PRIME:
+        # 1: Q staged through LDS after the first KV loads; 2: Q loaded to
+        # registers after the first KV loads.
+        gl.static_assert(EARLY_PRIME == 1 or EARLY_PRIME == 2)
+        gl.static_assert(not USE_LDS_PIPELINE and not Q_FROM_LDS)
+        gl.static_assert(QUERY_DTYPE != "nvfp4" and KV_CACHE_DTYPE != "nvfp4")
     cfg = MLAConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
@@ -2200,16 +2336,17 @@ def _mla_decode_fwd_kernel(
         KV_LORA_RANK_LOAD: gl.constexpr = KV_LORA_RANK
         QK_ROPE_HEAD_DIM_LOAD: gl.constexpr = QK_ROPE_HEAD_DIM
 
-    q_lora_shared = gl.allocate_shared_memory(
-        query_ptr.type.element_ty,
-        shape=[BLOCK_M, KV_LORA_RANK_LOAD],
-        layout=cfg.Q_LORA_SHARED_LAYOUT,
-    )
-    q_rope_shared = gl.allocate_shared_memory(
-        query_ptr.type.element_ty,
-        shape=[BLOCK_M, QK_ROPE_HEAD_DIM_LOAD],
-        layout=cfg.Q_ROPE_SHARED_LAYOUT,
-    )
+    if EARLY_PRIME != 2:
+        q_lora_shared = gl.allocate_shared_memory(
+            query_ptr.type.element_ty,
+            shape=[BLOCK_M, KV_LORA_RANK_LOAD],
+            layout=cfg.Q_LORA_SHARED_LAYOUT,
+        )
+        q_rope_shared = gl.allocate_shared_memory(
+            query_ptr.type.element_ty,
+            shape=[BLOCK_M, QK_ROPE_HEAD_DIM_LOAD],
+            layout=cfg.Q_ROPE_SHARED_LAYOUT,
+        )
 
     # load Q
     offs_q_m_lora = gl.arange(
@@ -2242,20 +2379,27 @@ def _mla_decode_fwd_kernel(
     query_mask_1_lora = query_offset_1_lora < num_query_heads
 
     # Q_lora : (BLOCK_M, KV_LORA_RANK)
-    Q_lora_load = gl.load(
-        query_ptr + query_offset_lora + offs_q_d_lora[None, :],
-        mask=(
-            None
-            if USE_LDS_PIPELINE
-            else query_mask_0_lora[:, None] & query_mask_1_lora[:, None]
-        ),
-        other=None if USE_LDS_PIPELINE else 0.0,
-    )
-    q_lora_shared.store(Q_lora_load)
-    if Q_FROM_LDS:
-        Q_lora = q_lora_shared
+    if Q_NO_MASK:
+        # Padding rows read a valid row instead of a masked one: the loads need
+        # no branches, so they are all in flight at once.
+        q_lora_rows = (
+            q_start_idx + gl.minimum(query_pos_lora, num_tokens_per_seq - 1)
+        ) * query_stride_0 + gl.minimum(
+            query_offset_1_lora, num_query_heads - 1
+        ) * query_stride_1
+        q_lora_ptrs = query_ptr + q_lora_rows[:, None] + offs_q_d_lora[None, :]
+        q_lora_mask = None
+        q_other = None
     else:
-        Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
+        q_lora_ptrs = query_ptr + query_offset_lora + offs_q_d_lora[None, :]
+        q_lora_mask = query_mask_0_lora[:, None] & query_mask_1_lora[:, None]
+        q_other = 0.0
+    if not EARLY_PRIME:
+        Q_lora_load = gl.load(
+            q_lora_ptrs,
+            mask=None if USE_LDS_PIPELINE else q_lora_mask,
+            other=None if USE_LDS_PIPELINE else q_other,
+        )
 
     query_pos_rope = (
         token_q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
@@ -2274,20 +2418,37 @@ def _mla_decode_fwd_kernel(
     query_mask_1_rope = query_offset_1_rope < num_query_heads
 
     # Q_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
-    Q_rope_load = gl.load(
-        query_ptr + query_offset_rope + (KV_LORA_RANK_LOAD + offs_q_d_rope)[None, :],
-        mask=(
-            None
-            if USE_LDS_PIPELINE
-            else query_mask_0_rope[:, None] & query_mask_1_rope[:, None]
-        ),
-        other=None if USE_LDS_PIPELINE else 0.0,
-    )
-    q_rope_shared.store(Q_rope_load)
-    if Q_FROM_LDS:
-        Q_rope = q_rope_shared
+    if Q_NO_MASK:
+        q_rope_rows = (
+            q_start_idx + gl.minimum(query_pos_rope, num_tokens_per_seq - 1)
+        ) * query_stride_0 + gl.minimum(
+            query_offset_1_rope, num_query_heads - 1
+        ) * query_stride_1
+        q_rope_ptrs = (
+            query_ptr
+            + q_rope_rows[:, None]
+            + (KV_LORA_RANK_LOAD + offs_q_d_rope)[None, :]
+        )
+        q_rope_mask = None
     else:
-        Q_rope = q_rope_shared.load(layout=cfg.Q_DOT_LAYOUT)
+        q_rope_ptrs = (
+            query_ptr + query_offset_rope + (KV_LORA_RANK_LOAD + offs_q_d_rope)[None, :]
+        )
+        q_rope_mask = query_mask_0_rope[:, None] & query_mask_1_rope[:, None]
+    if not EARLY_PRIME:
+        Q_rope_load = gl.load(
+            q_rope_ptrs,
+            mask=None if USE_LDS_PIPELINE else q_rope_mask,
+            other=None if USE_LDS_PIPELINE else q_other,
+        )
+    if EARLY_PRIME:
+        # Placeholders: Q is loaded after the first KV loads are issued.
+        Q_lora = seq_len
+        Q_rope = seq_len
+    else:
+        Q_lora, Q_rope = _mla_process_q(
+            cfg, Q_lora_load, Q_rope_load, q_lora_shared, q_rope_shared
+        )
 
     if QUERY_DTYPE == "nvfp4":
         # A4W4
@@ -2431,6 +2592,54 @@ def _mla_decode_fwd_kernel(
         stride_kv_buffer_3,
     )
 
+    if EARLY_PRIME:
+        # Issue the first KV loads, then wait for Q and store it: the Q global
+        # loads and the first pages are in flight together.
+        if num_stages > 2:
+            _mla_ring_prime(
+                pgm, block_tables_ptr_shifted, segm_idx * tiles_per_segment, num_stages
+            )
+        else:
+            j_hbm_early: gl.int32 = 0
+            j_hbm_early, first_block_idx = pgm.load_physical_block_idx(
+                j_hbm_early, block_tables_ptr_shifted, segm_idx * tiles_per_segment
+            )
+            j_hbm_early, next_block_idx_early = pgm.load_physical_block_idx_with_mod(
+                j_hbm_early,
+                block_tables_ptr_shifted,
+                segm_idx * tiles_per_segment,
+                pgm.tile_end - pgm.tile_start,
+            )
+            first_row_offsets = pgm.get_kv_buffer_row_offsets(first_block_idx)
+            pgm.tdm_load_global_to_shared_kv_lora(first_row_offsets, 0)
+            pgm.tdm_load_global_to_shared_k_rope(first_row_offsets, 0)
+        # The Q loads go after the page-id loads, so the TDM issue above does
+        # not wait for them (load counters complete in order).
+        if EARLY_PRIME == 1:
+            # Stage Q through LDS, as without EARLY_PRIME. The LDS buffers stay
+            # live beside the KV ring, which can lower occupancy.
+            Q_lora_load = gl.load(q_lora_ptrs, mask=q_lora_mask, other=q_other)
+            Q_rope_load = gl.load(q_rope_ptrs, mask=q_rope_mask, other=q_other)
+            Q_lora, Q_rope = _mla_process_q(
+                cfg, Q_lora_load, Q_rope_load, q_lora_shared, q_rope_shared
+            )
+        else:
+            # Load Q straight into the WMMA operand layout, without LDS.
+            Q_lora, Q_rope = _mla_load_q_regs(
+                cfg,
+                query_ptr,
+                q_start_idx,
+                token_q_block_local_idx,
+                kv_head_idx,
+                head_offset,
+                query_stride_0,
+                query_stride_1,
+                num_tokens_per_seq,
+                num_query_heads,
+                Q_NO_MASK,
+            )
+        pgm = pgm.with_q(Q_lora, Q_rope)
+
     if USE_LDS_PIPELINE:
         _mla_decode_lds_pipeline(
             pgm,
@@ -2456,6 +2665,7 @@ def _mla_decode_fwd_kernel(
             seq_len,
             qk_factor,
             num_stages,
+            PRIMED=EARLY_PRIME,
         )
     else:
         if KV_CACHE_DTYPE == "nvfp4":
@@ -2468,15 +2678,20 @@ def _mla_decode_fwd_kernel(
         j_hbm: gl.int32 = 0
         buffer_id: gl.int32 = 0
 
-        j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start
-        )
-        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
-        )
-        row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
-        pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
-        pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
+        if EARLY_PRIME:
+            j_hbm = j_hbm_early
+            physical_block_idx = first_block_idx
+            next_physical_block_idx = next_block_idx_early
+        else:
+            j_hbm, physical_block_idx = pgm.load_physical_block_idx(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start
+            )
+            j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
+            )
+            row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
+            pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
+            pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
 
         for _ in range(pgm.tile_start, pgm.tile_end - 1):
             physical_block_idx = next_physical_block_idx

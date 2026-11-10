@@ -984,23 +984,25 @@ def test_mla_decode_fwd_unshuffled_tuned_h64(
 
 
 @pytest.mark.parametrize(
-    "batch_size, max_seqlen_kv, expect_tuned",
+    "batch_size, max_seqlen_kv, expect_flags",
     [
-        # B=1 at KV <= 16384 has an empty entry on purpose: the untuned path won.
-        (1, 9216, False),
-        (4, 9216, True),
-        (32, 9216, True),
-        (128, 9216, True),
-        (8, 32768, True),
+        # (EARLY_PRIME, Q_NO_MASK) of the entry; None: no entry (untuned path).
+        (1, 9216, (1, 1)),  # Q staged through LDS after the first KV loads
+        (4, 9216, (1, 1)),
+        (16, 9216, (2, 1)),  # Q loaded to registers after the first KV loads
+        (104, 9216, (0, 1)),  # unmasked Q load only
+        (96, 9216, (0, 0)),  # entry without the new flags
+        (1, 65536, None),  # beyond the tuned KV range
     ],
 )
 @torch.inference_mode()
 def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
-    monkeypatch, batch_size, max_seqlen_kv, expect_tuned
+    monkeypatch, batch_size, max_seqlen_kv, expect_flags
 ):
     """TP8 entries (H=8, bf16 query, fp8 KV) of the bf16_fp8 group. The launch
-    uses the entry's warps, stages, split count and partial dtype, and an empty
-    entry keeps the untuned path."""
+    uses the entry's warps, stages, split count, partial dtype, early KV prime
+    (EARLY_PRIME) and unmasked Q load (Q_NO_MASK); no entry keeps the untuned
+    path."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("unshuffled LDS pipeline requires gfx1250")
 
@@ -1009,7 +1011,7 @@ def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
     entry = mla_module._tuned_decode_config(
         "pipelined_unshuffled", "bf16", "fp8", 8, batch_size, max_seqlen_kv
     )
-    assert bool(entry) == expect_tuned, entry
+    assert bool(entry) == (expect_flags is not None), entry
     grid, kwargs, num_pages, _, ref_args = _run_tuned_unshuffled_decode(
         monkeypatch, 8, batch_size, max_seqlen_kv, fp8_query=False
     )
@@ -1018,6 +1020,8 @@ def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
         for key in ("num_warps", "num_stages", "waves_per_eu"):
             assert kwargs[key] == entry[key], (key, kwargs[key], entry[key])
         assert kwargs.get("Q_FROM_LDS", 0) == entry.get("Q_FROM_LDS", 0)
+        flags = (kwargs.get("EARLY_PRIME", 0), kwargs.get("Q_NO_MASK", 0))
+        assert flags == expect_flags, (flags, entry)
     if "NPOT_SPLITS" in entry:
         # NPOT_SPLITS: the measured count, without power-of-2 rounding.
         assert grid[2] == min(entry["NPOT_SPLITS"], num_pages)
